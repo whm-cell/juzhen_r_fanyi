@@ -1,0 +1,1303 @@
+//! 程序入口：初始化日志、加载 Slint UI，并准备后续 VM 绑定
+
+use std::{cell::RefCell, rc::Rc, path::PathBuf};
+use tracing_subscriber::fmt::SubscriberBuilder;
+use slint::{ComponentHandle, ModelRc, VecModel};
+use serde_json::Value;
+
+slint::include_modules!();
+
+mod model;
+mod utils;
+mod vm;
+
+use model::{data_core::AppState, shadow_tree::JsonTreeNode};
+use vm::bridge::*;
+use std::time::Instant;
+
+// TreeNodeData转换实现
+impl From<&JsonTreeNode> for TreeNodeData {
+    /// 将Rust JsonTreeNode转换为Slint可用的数据结构
+    fn from(node: &JsonTreeNode) -> Self {
+        Self {
+            name: node.name.clone().into(),
+            path: node.path.clone().into(),
+            kind: format!("{:?}", node.kind).into(), // Object/Array/String等
+            children: node.children as i32,
+            preview: node.preview.clone().into(),
+            depth: node.depth as i32,
+            expanded: node.expanded,
+            visible: true, // 在Rust端已过滤，这里总是true
+        }
+    }
+}
+
+// SearchItemData 转换实现（用于搜索结果列表）
+impl From<&JsonTreeNode> for SearchItemData {
+    fn from(node: &JsonTreeNode) -> Self {
+        Self {
+            name: node.name.clone().into(),
+            path: node.path.clone().into(),
+            kind: format!("{:?}", node.kind).into(),
+        }
+    }
+}
+
+
+/// VM桥接器：管理UI与数据层的交互
+struct ViewModelBridge {
+    app_state: Rc<RefCell<AppState>>,
+    // 分页数据缓存
+    preview_full_text: Rc<RefCell<String>>,
+    final_full_text: Rc<RefCell<String>>,
+}
+
+impl ViewModelBridge {
+    /// 创建新的VM桥接器并绑定所有回调
+    fn new(app_window: &AppWindow, app_state: Rc<RefCell<AppState>>) -> Self {
+        let bridge = Self {
+            app_state: app_state.clone(),
+            preview_full_text: Rc::new(RefCell::new(String::new())),
+            final_full_text: Rc::new(RefCell::new(String::new())),
+        };
+
+        // 绑定所有UI回调
+        bridge.setup_callbacks(app_window);
+        bridge
+    }
+
+    /// 设置所有UI回调函数
+    fn setup_callbacks(&self, app_window: &AppWindow) {
+        let app_state = self.app_state.clone();
+
+        // === 加载文件回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_load_file(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_load_file(&app_window, &app_state);
+                }
+            });
+        }
+
+        // === 节点选择回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_node_selected(move |json_path| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_node_selected(&app_window, &app_state, &json_path.to_string());
+                }
+            });
+        }
+
+        // === 复制按钮回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_copy_pressed(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_copy_pressed(&app_window, &app_state);
+                }
+            });
+        }
+
+        // === 回写按钮回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_write_back_pressed(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_write_back_pressed(&app_window, &app_state);
+                }
+            });
+        }
+
+        // === 一键获得最终产物回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            let preview_full_text = self.preview_full_text.clone();
+            let final_full_text = self.final_full_text.clone();
+            app_window.on_one_click_final_product(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_one_click_final_product(&app_window, &app_state, &preview_full_text, &final_full_text);
+                }
+            });
+        }
+
+        // === 搜索过滤回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_search_changed(move |filter_text| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_search_changed(&app_window, &app_state, &filter_text.to_string());
+                }
+            });
+        }
+
+        // === 搜索结果项选择回调（列表→详情） ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_search_item_selected(move |sel_path| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_search_item_selected(&app_window, &app_state, &sel_path.to_string());
+                }
+            });
+        }
+
+        // === 复制全部回调（后台聚合） ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            let preview_full_text = self.preview_full_text.clone();
+            app_window.on_copy_all_pressed(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_copy_all_pressed(&app_window, &app_state, &preview_full_text);
+                }
+            });
+        }
+
+
+        // === 转换与复制最终 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            let preview_full_text = self.preview_full_text.clone();
+            let final_full_text = self.final_full_text.clone();
+            app_window.on_transform_pressed(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_transform_pressed(&app_window, &app_state, &preview_full_text, &final_full_text);
+                }
+            });
+        }
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            let final_full_text = self.final_full_text.clone();
+            app_window.on_copy_final_pressed(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_copy_final_pressed(&app_window, &app_state, &final_full_text);
+                }
+            });
+        }
+
+        // === 分页回调 ===
+        {
+            let app_window_weak = app_window.as_weak();
+            let preview_full_text = self.preview_full_text.clone();
+            app_window.on_preview_page_changed(move |page| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_preview_page_changed(&app_window, &preview_full_text, page);
+                }
+            });
+        }
+        {
+            let app_window_weak = app_window.as_weak();
+            let final_full_text = self.final_full_text.clone();
+            app_window.on_final_page_changed(move |page| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_final_page_changed(&app_window, &final_full_text, page);
+                }
+            });
+        }
+
+        // === 回写功能回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            let preview_full_text = self.preview_full_text.clone();
+            app_window.on_upload_writeback_file(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_upload_writeback_file(&app_window, &app_state, &preview_full_text);
+                }
+            });
+        }
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_save_modified_json(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_save_modified_json(&app_window, &app_state);
+                }
+            });
+        }
+
+        // === 清空回写日志回调 ===
+        {
+            let app_window_weak = app_window.as_weak();
+            app_window.on_clear_writeback_log(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    app_window.set_writeback_log("".into());
+                }
+            });
+        }
+
+        // === 节点展开/折叠回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_toggle_node_expanded(move |node_path| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_toggle_node_expanded(&app_window, &app_state, &node_path.to_string());
+                }
+            });
+        }
+    }
+
+    /// 初始化UI状态
+    fn initialize_ui(&self, app_window: &AppWindow) {
+        app_window.set_status_message(STATUS_READY.into());
+        app_window.set_current_path("".into());
+        app_window.set_preview_text("".into());
+        app_window.set_paste_text("".into());
+        app_window.set_selected_json_path("".into());
+        app_window.set_writeback_log("".into());
+
+        // 设置空的树模型
+        let empty_model = ModelRc::new(VecModel::<TreeNodeData>::default());
+        app_window.set_tree_model(empty_model);
+    }
+
+    /// 显示文件选择对话框
+    fn show_file_dialog() -> Option<PathBuf> {
+        use rfd::FileDialog;
+
+        // 使用原生文件对话框选择JSON文件
+        let file_path = FileDialog::new()
+            .add_filter("JSON文件", &["json"])
+            .add_filter("所有文件", &["*"])
+            .set_title("选择要处理的JSON文件")
+            .pick_file();
+
+        match file_path {
+            Some(path) => {
+                tracing::info!("用户选择了文件: {}", path.display());
+                Some(path)
+            }
+            None => {
+                tracing::info!("用户取消了文件选择");
+                None
+            }
+        }
+    }
+
+    /// 处理加载文件操作
+    fn handle_load_file(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        // 使用文件对话框选择JSON文件
+        let file_path = match Self::show_file_dialog() {
+            Some(path) => path,
+            None => {
+                app_window.set_status_message("未选择文件".into());
+                return;
+            }
+        };
+
+        app_window.set_status_message(STATUS_LOADING.into());
+        app_window.set_performance_info("".into());
+
+        // 开始性能监控
+        let start_time = Instant::now();
+
+        let load_result = app_state.borrow_mut().load_file(&file_path);
+        match load_result {
+            Ok(()) => {
+                let load_duration = start_time.elapsed();
+
+                // 设置根节点为展开状态
+                if !app_state.borrow().tree_flat.is_empty() {
+                    app_state.borrow_mut().tree_flat[0].expanded = true;
+                    app_state.borrow_mut().update_visibility_by_expansion();
+                }
+
+                // 在新的作用域中进行不可变借用
+                let (path_str, tree_data, node_count) = {
+                    let state = app_state.borrow();
+                    let path_str = state.source_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+
+                    // 转换树模型数据 - 只包含可见的节点
+                    let tree_data: Vec<TreeNodeData> = state.tree_flat
+                        .iter()
+                        .filter(|node| node.visible)
+                        .map(TreeNodeData::from)
+                        .collect();
+
+                    let node_count = state.tree_flat.len();
+                    (path_str, tree_data, node_count)
+                };
+
+                app_window.set_current_path(path_str.into());
+                let model = ModelRc::new(VecModel::from(tree_data));
+                app_window.set_tree_model(model);
+
+                // 显示性能信息
+                let perf_info = format!("加载: {:.2}ms | 节点: {} | 内存: ~{:.1}MB",
+                    load_duration.as_millis(),
+                    node_count,
+                    (node_count as f64 * 0.1) // 估算内存使用
+                );
+                app_window.set_performance_info(perf_info.into());
+
+                app_window.set_status_message(STATUS_LOADED.into());
+                tracing::info!("文件加载成功: {} 个节点，耗时: {:.2}ms",
+                    node_count, load_duration.as_millis());
+            }
+            Err(e) => {
+                let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("文件加载失败: {}", e);
+            }
+        }
+    }
+
+    /// 处理节点选择操作
+    fn handle_node_selected(
+        app_window: &AppWindow,
+        app_state: &Rc<RefCell<AppState>>,
+        json_path: &str
+    ) {
+        // 检查是否在搜索状态，如果是则不覆盖搜索结果
+
+
+        let search_text = app_window.get_search_filter().to_string();
+        if !search_text.trim().is_empty() {
+            tracing::info!("搜索状态下跳过节点选择: {}", json_path);
+            return;
+        }
+
+        app_window.set_selected_json_path(json_path.into());
+
+        // 开始性能监控
+        let start_time = Instant::now();
+
+        match app_state.borrow().extract_subtree_pretty(json_path) {
+            Ok(pretty_json) => {
+                let extract_duration = start_time.elapsed();
+                app_window.set_preview_text(pretty_json.into());
+
+                // 更新性能信息（保留加载信息，添加提取信息）
+                let current_perf = app_window.get_performance_info().to_string();
+                let extract_info = format!("提取: {:.1}ms", extract_duration.as_millis());
+                let new_perf = if current_perf.is_empty() {
+                    extract_info
+                } else {
+                    format!("{} | {}", current_perf, extract_info)
+                };
+                app_window.set_performance_info(new_perf.into());
+
+                tracing::info!("节点选择成功: {}，耗时: {:.1}ms", json_path, extract_duration.as_millis());
+            }
+            Err(e) => {
+                let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("节点选择失败: {}", e);
+            }
+        }
+    }
+
+    /// 处理复制按钮操作（优先复制选中节点的完整 JSON；否则复制预览区文本）
+    fn handle_copy_pressed(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        let selected_path = app_window.get_selected_json_path().to_string();
+        let preview_text = app_window.get_preview_text().to_string();
+
+        // 优先尝试基于选中路径提取完整 JSON（保持原始深度）
+        let content_to_copy = if !selected_path.is_empty() && selected_path.starts_with("$") && !selected_path.starts_with("搜索结果") {
+            match app_state.borrow().extract_subtree_pretty(&selected_path) {
+                Ok(pretty) => Some(pretty),
+                Err(e) => {
+                    tracing::warn!("基于路径提取失败，将回退使用预览文本: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let final_text = content_to_copy.unwrap_or(preview_text);
+
+        if final_text.trim().is_empty() {
+            app_window.set_status_message("错误: 没有可复制的内容".into());
+            return;
+        }
+
+        match utils::clipboard::copy_to_clipboard(&final_text) {
+            Ok(()) => {
+                app_window.set_status_message(STATUS_COPIED.into());
+                tracing::info!("内容已复制到剪贴板，长度: {} 字符", final_text.len());
+            }
+            Err(e) => {
+                let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("复制失败: {}", e);
+            }
+        }
+    }
+
+    /// 添加日志到回写日志区域（异步版本，避免阻塞UI线程）
+    fn append_writeback_log(app_window: &AppWindow, message: &str) {
+        let current_log = app_window.get_writeback_log().to_string();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() % 86400000; // 取一天内的毫秒数
+        let seconds = timestamp / 1000;
+        let millis = timestamp % 1000;
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let secs = seconds % 60;
+        let time_str = format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, secs, millis);
+        let new_entry = format!("[{}] {}", time_str, message);
+        let updated_log = if current_log.is_empty() {
+            new_entry
+        } else {
+            format!("{}\n{}", current_log, new_entry)
+        };
+
+        // 直接设置日志，避免复杂的异步处理
+        app_window.set_writeback_log(updated_log.into());
+
+        // 控制台输出用于调试
+        println!("日志已更新: {}", message);
+
+        // 打印到控制台用于调试
+        tracing::info!("回写日志: {}", message);
+    }
+
+    /// 处理回写按钮操作
+    fn handle_write_back_pressed(
+        app_window: &AppWindow,
+        app_state: &Rc<RefCell<AppState>>
+    ) {
+        let paste_text = app_window.get_paste_text().to_string();
+        let selected_path = app_window.get_selected_json_path().to_string();
+
+        Self::append_writeback_log(app_window, "开始回写操作...");
+
+        if paste_text.trim().is_empty() {
+            Self::append_writeback_log(app_window, "❌ 错误: 粘贴区域为空");
+            app_window.set_status_message("错误: 粘贴区域为空".into());
+            return;
+        }
+
+        if selected_path.is_empty() {
+            Self::append_writeback_log(app_window, "❌ 错误: 未选择节点");
+            app_window.set_status_message("错误: 未选择节点".into());
+            return;
+        }
+
+        Self::append_writeback_log(app_window, &format!("📍 目标路径: {}", selected_path));
+        Self::append_writeback_log(app_window, &format!("📝 数据长度: {} 字符", paste_text.len()));
+
+        // 开始性能监控
+        let start_time = Instant::now();
+
+        Self::append_writeback_log(app_window, "🔄 正在执行JSON更新...");
+        let update_result = app_state.borrow_mut().update_node_from_str(&selected_path, &paste_text);
+        match update_result {
+            Ok(()) => {
+                let update_duration = start_time.elapsed();
+                Self::append_writeback_log(app_window, &format!("✅ JSON更新成功 (耗时: {:.1}ms)", update_duration.as_millis()));
+
+                Self::append_writeback_log(app_window, "🔄 正在刷新UI界面...");
+                // 在新的作用域中进行不可变借用
+                let (tree_data, updated_preview) = {
+                    let state = app_state.borrow();
+                    let tree_data: Vec<TreeNodeData> = state.tree_flat
+                        .iter()
+                        .filter(|node| node.visible)
+                        .map(TreeNodeData::from)
+                        .collect();
+
+                    let updated_preview = state.extract_subtree_pretty(&selected_path).ok();
+                    (tree_data, updated_preview)
+                };
+
+                let model = ModelRc::new(VecModel::from(tree_data));
+                app_window.set_tree_model(model);
+                Self::append_writeback_log(app_window, "✅ 树视图已更新");
+
+                // 刷新预览区域
+                if let Some(preview) = updated_preview {
+                    app_window.set_preview_text(preview.into());
+                    Self::append_writeback_log(app_window, "✅ 预览区域已更新");
+                } else {
+                    Self::append_writeback_log(app_window, "⚠️ 预览区域更新失败");
+                }
+
+                // 更新性能信息
+                let current_perf = app_window.get_performance_info().to_string();
+                let update_info = format!("回写: {:.1}ms", update_duration.as_millis());
+                let new_perf = if current_perf.contains("回写:") {
+                    // 替换现有的回写信息
+                    current_perf.split(" | ").filter(|s| !s.starts_with("回写:"))
+                        .chain(std::iter::once(update_info.as_str()))
+                        .collect::<Vec<_>>().join(" | ")
+                } else {
+                    format!("{} | {}", current_perf, update_info)
+                };
+                app_window.set_performance_info(new_perf.into());
+
+                app_window.set_status_message(STATUS_WRITE_BACK_SUCCESS.into());
+                Self::append_writeback_log(app_window, "🎉 回写操作完成！");
+                tracing::info!("回写成功: {}，耗时: {:.1}ms", selected_path, update_duration.as_millis());
+            }
+            Err(e) => {
+                Self::append_writeback_log(app_window, &format!("❌ 回写失败: {}", e));
+                let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("回写失败: {}", e);
+            }
+        }
+    }
+
+    /// 一键获得最终产物：自动执行生成中间产物2 + 转换为最终产物
+    fn handle_one_click_final_product(
+        app_window: &AppWindow,
+        app_state: &Rc<RefCell<AppState>>,
+        preview_full_text: &Rc<RefCell<String>>,
+        final_full_text: &Rc<RefCell<String>>
+    ) {
+        let filter = app_window.get_search_filter().to_string();
+        if filter.trim().is_empty() {
+            app_window.set_status_message("错误: 过滤条件为空，请先设置搜索条件".into());
+            return;
+        }
+
+        // 显示进度条
+        app_window.invoke_show_progress("正在一键生成最终产物...".into());
+
+        // 使用 spawn_local 让长时间操作异步执行，保持UI响应
+        let app_weak = app_window.as_weak();
+        let app_state_clone = app_state.clone();
+        let preview_full_text_clone = preview_full_text.clone();
+        let final_full_text_clone = final_full_text.clone();
+        let filter_clone = filter.clone();
+
+        slint::spawn_local(async move {
+            tracing::info!("一键获得最终产物：开始执行");
+
+            // 第一阶段：生成中间产物2
+            app_weak.upgrade().map(|app| app.invoke_update_progress(0.1, "正在生成中间产物...".into()));
+
+            let app_weak_progress = app_weak.clone();
+            let progress_callback = move |progress: f32, message: &str| {
+                // 将进度映射到0.1-0.5范围（第一阶段占50%）
+                let mapped_progress = 0.1 + progress * 0.4;
+                if let Some(app) = app_weak_progress.upgrade() {
+                    app.invoke_update_progress(mapped_progress, format!("阶段1: {}", message).into());
+                }
+            };
+
+            match app_state_clone.borrow().build_intermediate_stage2(&filter_clone, progress_callback) {
+                Ok(stage2_json) => {
+                    tracing::info!("一键获得最终产物：中间产物2生成成功");
+
+                    // 保存中间产物到preview_full_text
+                    *preview_full_text_clone.borrow_mut() = stage2_json.clone();
+
+                    if let Some(app) = app_weak.upgrade() {
+                        // 显示中间产物2在预览区域
+                        let (page_text, total_pages) = ViewModelBridge::paginate_text(&stage2_json, 1, 300);
+                        app.set_preview_text(page_text.into());
+                        app.set_preview_current_page(1);
+                        app.set_preview_total_pages(total_pages);
+                        app.set_selected_json_path("中间产物第二阶段".into());
+
+                        app.invoke_update_progress(0.5, "正在转换为最终产物...".into());
+
+                        // 第二阶段：转换为最终产物
+                        match serde_json::from_str::<Value>(&stage2_json) {
+                            Ok(v) => {
+                                app.invoke_update_progress(0.6, "正在处理数据项...".into());
+
+                                // 使用BTreeMap自动排序
+                                let mut out = std::collections::BTreeMap::new();
+
+                                if let Some(items) = v.get("items").and_then(|x| x.as_array()) {
+                                    let total_items = items.len();
+                                    for (index, item) in items.iter().enumerate() {
+                                        // 将进度映射到0.6-0.8范围
+                                        let progress = 0.6 + (index as f32 / total_items as f32) * 0.2;
+                                        if index % 100 == 0 || index == total_items - 1 {
+                                            app.invoke_update_progress(progress, format!("阶段2: 处理项目 {}/{}", index + 1, total_items).into());
+                                        }
+
+                                        let seq = item.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+                                        let name_val = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                        out.insert(seq.to_string(), serde_json::Value::String(name_val.to_string()));
+                                    }
+                                }
+
+                                app.invoke_update_progress(0.8, "正在构建最终JSON...".into());
+
+                                // 构建最终JSON
+                                let final_json = serde_json::Value::Object(out.into_iter().collect());
+                                match serde_json::to_string_pretty(&final_json) {
+                                    Ok(s) => {
+                                        app.invoke_update_progress(0.9, "正在格式化输出...".into());
+
+                                        // 保存完整文本
+                                        *final_full_text_clone.borrow_mut() = s.clone();
+
+                                        // 计算分页并显示第一页
+                                        let (page_text, total_pages) = ViewModelBridge::paginate_text(&s, 1, 300);
+                                        app.set_final_product_text(page_text.into());
+                                        app.set_final_current_page(1);
+                                        app.set_final_total_pages(total_pages);
+
+                                        app.invoke_update_progress(1.0, "完成".into());
+                                        app.set_status_message("一键获得最终产物完成！".into());
+
+                                        // 隐藏进度条
+                                        app.invoke_hide_progress();
+
+                                        tracing::info!("一键获得最终产物：执行成功");
+                                    }
+                                    Err(e) => {
+                                        app.invoke_hide_progress();
+                                        let msg = format!("{}最终产物格式化失败: {}", STATUS_ERROR_PREFIX, e);
+                                        app.set_status_message(msg.into());
+                                        tracing::error!("一键获得最终产物：最终产物格式化失败: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.invoke_hide_progress();
+                                let msg = format!("{}中间产物解析失败: {}", STATUS_ERROR_PREFIX, e);
+                                app.set_status_message(msg.into());
+                                tracing::error!("一键获得最终产物：中间产物解析失败: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.invoke_hide_progress();
+                        let msg = format!("{}生成中间产物失败: {}", STATUS_ERROR_PREFIX, e);
+                        app.set_status_message(msg.into());
+                    }
+                    tracing::error!("一键获得最终产物：生成中间产物失败: {}", e);
+                }
+            }
+        }).unwrap();
+    }
+
+    /// 处理另存为按钮操作
+    fn handle_save_as_pressed(
+        app_window: &AppWindow,
+        app_state: &Rc<RefCell<AppState>>
+    ) {
+        // 目前使用硬编码路径进行测试（后续可添加文件对话框）
+        let save_path = std::path::Path::new("output.json");
+
+        // 开始性能监控
+        let start_time = Instant::now();
+
+        match app_state.borrow().save_to_file(save_path) {
+            Ok(()) => {
+                let save_duration = start_time.elapsed();
+                let success_msg = format!("文件已保存到: {}", save_path.display());
+                app_window.set_status_message(success_msg.into());
+
+                // 更新性能信息
+                let current_perf = app_window.get_performance_info().to_string();
+                let save_info = format!("保存: {:.1}ms", save_duration.as_millis());
+                let new_perf = if current_perf.contains("保存:") {
+                    // 替换现有的保存信息
+                    current_perf.split(" | ").filter(|s| !s.starts_with("保存:"))
+                        .chain(std::iter::once(save_info.as_str()))
+                        .collect::<Vec<_>>().join(" | ")
+                } else {
+                    format!("{} | {}", current_perf, save_info)
+                };
+                app_window.set_performance_info(new_perf.into());
+
+                tracing::info!("文件保存成功: {}，耗时: {:.1}ms", save_path.display(), save_duration.as_millis());
+            }
+            Err(e) => {
+                let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("文件保存失败: {}", e);
+            }
+        }
+    }
+
+    /// 处理搜索过滤改变
+    fn handle_search_changed(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, filter: &str) {
+        let start_time = Instant::now();
+
+        // 应用搜索过滤
+        app_state.borrow_mut().apply_search_filter(filter);
+
+        // 更新树视图 - 只包含可见的节点
+        let tree_data: Vec<TreeNodeData> = app_state.borrow().tree_flat
+            .iter()
+            .filter(|node| node.visible)
+            .map(TreeNodeData::from)
+            .collect();
+
+        let tree_model = ModelRc::new(VecModel::from(tree_data));
+
+
+
+        app_window.set_tree_model(tree_model);
+
+        // 搜索模式：仅构建“匹配列表”模型，不在预览区一次性渲染聚合内容
+        if filter.trim().is_empty() {
+            app_window.set_preview_text("".into());
+            app_window.set_selected_json_path("".into());
+            let empty: Vec<SearchItemData> = Vec::new();
+            app_window.set_search_results(ModelRc::new(VecModel::from(empty)));
+        } else {
+            let filter_lower = filter.to_lowercase();
+            let items: Vec<SearchItemData> = {
+                let state = app_state.borrow();
+                state
+                    .tree_flat
+                    .iter()
+                    .filter(|n| n.name.to_lowercase().contains(&filter_lower) || n.path.to_lowercase().contains(&filter_lower))
+                    .map(SearchItemData::from)
+                    .collect()
+            };
+            app_window.set_search_results(ModelRc::new(VecModel::from(items)));
+
+            // 仅设置提示，不强制渲染详情；详情通过点击列表项加载
+            app_window.set_preview_text("".into());
+            app_window.set_selected_json_path(format!("搜索结果: {}", filter).into());
+        }
+
+        let filter_duration = start_time.elapsed();
+
+        // 更新状态消息
+        if filter.trim().is_empty() {
+            app_window.set_status_message("已清除搜索过滤".into());
+        } else {
+            let visible_count = app_state.borrow().tree_flat.iter().filter(|n| n.visible).count();
+            app_window.set_status_message(format!("搜索过滤: {} (显示 {} 个节点)", filter, visible_count).into());
+        }
+
+        tracing::info!("搜索过滤应用: {}，耗时: {:.1}ms", filter, filter_duration.as_millis());
+    }
+
+    /// 处理节点展开/折叠切换
+    fn handle_toggle_node_expanded(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, node_path: &str) {
+        let start_time = Instant::now();
+
+        // 切换节点展开状态
+        app_state.borrow_mut().toggle_node_expanded(node_path);
+
+        // 更新树视图 - 只包含可见的节点
+        let tree_data: Vec<TreeNodeData> = app_state.borrow().tree_flat
+            .iter()
+            .filter(|node| node.visible)
+            .map(TreeNodeData::from)
+            .collect();
+
+        let tree_model = ModelRc::new(VecModel::from(tree_data));
+        app_window.set_tree_model(tree_model);
+
+        let toggle_duration = start_time.elapsed();
+
+        // 更新状态消息
+        let node_name = app_state.borrow().tree_flat
+            .iter()
+
+            .find(|n| n.path == node_path)
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+
+        let expanded = app_state.borrow().tree_flat
+            .iter()
+            .find(|n| n.path == node_path)
+            .map(|n| n.expanded)
+            .unwrap_or(false);
+
+        let action = if expanded { "展开" } else { "折叠" };
+        app_window.set_status_message(format!("{}: {}", action, node_name).into());
+
+        tracing::info!("节点{}切换: {}，耗时: {:.1}ms", action, node_path, toggle_duration.as_millis());
+    }
+
+
+    /// 处理搜索结果项被点击（中间产物 第一阶段：仅选中列表项，不展示详情）
+    fn handle_search_item_selected(
+        app_window: &AppWindow,
+        _app_state: &Rc<RefCell<AppState>>,
+        json_path: &str,
+    ) {
+        app_window.set_selected_json_path(json_path.into());
+        app_window.set_status_message("已选中列表项（不展示详情）".into());
+    }
+
+
+
+    /// 生成“中间产物 第二阶段”：不复制到剪贴板，直接填充到预览区
+    fn handle_copy_all_pressed(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, preview_full_text: &Rc<RefCell<String>>) {
+        let filter = app_window.get_search_filter().to_string();
+        if filter.trim().is_empty() {
+            app_window.set_status_message("错误: 过滤条件为空".into());
+            return;
+        }
+        // 优化：预显示进度条并添加小延迟确保UI更新完成
+        let start_time = std::time::Instant::now();
+        tracing::info!("开始显示进度条");
+
+        app_window.invoke_show_progress("正在生成中间产物第二阶段...".into());
+
+        // 添加小延迟确保进度条显示完成
+        std::thread::sleep(std::time::Duration::from_millis(16)); // 约1帧时间
+
+        let progress_show_time = start_time.elapsed().as_millis();
+        tracing::info!("进度条显示调用已执行，耗时: {}ms", progress_show_time);
+
+        // 使用 spawn_local 让长时间操作异步执行，保持UI响应
+        let app_weak = app_window.as_weak();
+        let app_state_clone = app_state.clone();
+        let preview_full_text_clone = preview_full_text.clone();
+        let filter_clone = filter.clone();
+
+        slint::spawn_local(async move {
+            let build_start = std::time::Instant::now();
+            tracing::info!("异步任务开始：调用 build_intermediate_stage2");
+
+            // 优化：创建简化的进度回调，减少UI更新频率
+            let app_weak_progress = app_weak.clone();
+            let progress_callback = move |progress: f32, message: &str| {
+                let callback_start = std::time::Instant::now();
+
+                tracing::info!("进度回调被调用: {}% - {}", (progress * 100.0) as i32, message);
+                if let Some(app) = app_weak_progress.upgrade() {
+                    app.invoke_update_progress(progress, message.into());
+                    let callback_time = callback_start.elapsed().as_millis();
+                    tracing::info!("进度更新函数调用完成，耗时: {}ms", callback_time);
+                } else {
+                    tracing::warn!("无法获取app实例进行进度更新");
+                }
+            };
+
+            match app_state_clone.borrow().build_intermediate_stage2(&filter_clone, progress_callback) {
+                Ok(stage2_json) => {
+                    let build_time = build_start.elapsed().as_millis();
+                    tracing::info!("build_intermediate_stage2 执行成功，总耗时: {}ms，开始处理结果", build_time);
+
+                    if let Some(app) = app_weak.upgrade() {
+                        // 保存完整文本
+                        let save_start = std::time::Instant::now();
+                        tracing::info!("开始保存完整文本");
+                        *preview_full_text_clone.borrow_mut() = stage2_json.clone();
+                        let save_time = save_start.elapsed().as_millis();
+                        tracing::info!("保存完整文本完成，耗时: {}ms", save_time);
+
+                        // 计算分页并显示第一页
+                        let paginate_start = std::time::Instant::now();
+                        tracing::info!("开始计算分页");
+                        let (page_text, total_pages) = ViewModelBridge::paginate_text(&stage2_json, 1, 300);
+                        let paginate_time = paginate_start.elapsed().as_millis();
+                        tracing::info!("分页计算完成，耗时: {}ms", paginate_time);
+
+                        let ui_start = std::time::Instant::now();
+                        app.set_preview_text(page_text.into());
+                        app.set_preview_current_page(1);
+                        app.set_preview_total_pages(total_pages);
+
+                        app.set_selected_json_path("中间产物第二阶段".into());
+                        app.set_final_product_text("".into());
+
+                        tracing::info!("设置状态消息");
+                        app.set_status_message("已生成中间产物 第二阶段".into());
+                        let ui_time = ui_start.elapsed().as_millis();
+                        tracing::info!("UI更新完成，耗时: {}ms", ui_time);
+
+                        // 暂时不隐藏进度条，让用户看到完成状态
+                        // app.invoke_hide_progress();
+                    }
+                }
+                Err(e) => {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.invoke_hide_progress();
+                        let msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                        app.set_status_message(msg.into());
+                    }
+                    tracing::error!("生成中间产物 第二阶段 失败: {}", e);
+                }
+            }
+        }).unwrap();
+    }
+
+    /// 将中间产物2转换为最终产物 {seq: name_value}
+    fn handle_transform_pressed(app_window: &AppWindow, _app_state: &Rc<RefCell<AppState>>, preview_full_text: &Rc<RefCell<String>>, final_full_text: &Rc<RefCell<String>>) {
+        let stage2_text = preview_full_text.borrow().clone();
+        if stage2_text.trim().is_empty() {
+            app_window.set_status_message("错误: 中间产物为空，无法转换".into());
+            return;
+        }
+
+        // 显示进度条
+        app_window.invoke_show_progress("正在生成最终产物...".into());
+        app_window.invoke_update_progress(0.1, "正在解析中间产物...".into());
+        match serde_json::from_str::<Value>(&stage2_text) {
+            Ok(v) => {
+                app_window.invoke_update_progress(0.3, "正在处理数据项...".into());
+
+                // 使用BTreeMap自动排序，避免额外的排序步骤
+                let mut out = std::collections::BTreeMap::new();
+
+                if let Some(items) = v.get("items").and_then(|x| x.as_array()) {
+                    let total_items = items.len();
+                    for (index, item) in items.iter().enumerate() {
+                        // 更新进度
+                        let progress = 0.3 + (index as f32 / total_items as f32) * 0.4;
+                        if index % 100 == 0 || index == total_items - 1 {
+                            app_window.invoke_update_progress(progress, format!("处理项目 {}/{}", index + 1, total_items).into());
+                        }
+
+                        let seq = item.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+                        let name_val = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        // 直接插入BTreeMap，自动按key排序
+                        out.insert(seq.to_string(), serde_json::Value::String(name_val.to_string()));
+                    }
+                }
+
+                app_window.invoke_update_progress(0.8, "正在构建最终JSON...".into());
+
+                // 直接从BTreeMap构建JSON对象，无需额外排序
+                let final_json = serde_json::Value::Object(out.into_iter().collect());
+                match serde_json::to_string_pretty(&final_json) {
+                    Ok(s) => {
+                        app_window.invoke_update_progress(0.9, "正在格式化输出...".into());
+
+                        // 保存完整文本
+                        *final_full_text.borrow_mut() = s.clone();
+
+                        // 计算分页并显示第一页
+                        let (page_text, total_pages) = Self::paginate_text(&s, 1, 300);
+                        app_window.set_final_product_text(page_text.into());
+                        app_window.set_final_current_page(1);
+                        app_window.set_final_total_pages(total_pages);
+
+                        app_window.invoke_update_progress(1.0, "完成".into());
+                        app_window.set_status_message("已构建最终产物".into());
+
+                        // 隐藏进度条
+                        app_window.invoke_hide_progress();
+                    }
+                    Err(e) => {
+                        app_window.invoke_hide_progress();
+                        let msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                        app_window.set_status_message(msg.into());
+                    }
+                }
+            }
+            Err(e) => {
+                app_window.invoke_hide_progress();
+                let msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(msg.into());
+            }
+        }
+    }
+
+    /// 复制最终产物到剪贴板
+    fn handle_copy_final_pressed(app_window: &AppWindow, _app_state: &Rc<RefCell<AppState>>, final_full_text: &Rc<RefCell<String>>) {
+        let text = final_full_text.borrow().clone();
+        if text.trim().is_empty() {
+            app_window.set_status_message("错误: 最终产物为空".into());
+            return;
+        }
+        match utils::clipboard::copy_to_clipboard(&text) {
+            Ok(()) => app_window.set_status_message(STATUS_COPIED.into()),
+            Err(e) => {
+                let msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(msg.into());
+            }
+        }
+    }
+
+    /// 文本分页：将文本按行分页，返回指定页的内容和总页数
+    fn paginate_text(text: &str, page: i32, lines_per_page: usize) -> (String, i32) {
+        let lines: Vec<&str> = text.lines().collect();
+        let total_lines = lines.len();
+        let total_pages = ((total_lines + lines_per_page - 1) / lines_per_page).max(1) as i32;
+
+        if page < 1 || page > total_pages {
+            return (String::new(), total_pages);
+        }
+
+        let start_idx = ((page - 1) as usize) * lines_per_page;
+        let end_idx = (start_idx + lines_per_page).min(total_lines);
+
+        let page_lines = &lines[start_idx..end_idx];
+        (page_lines.join("\n"), total_pages)
+    }
+
+    /// 处理中间产物分页改变
+    fn handle_preview_page_changed(app_window: &AppWindow, preview_full_text: &Rc<RefCell<String>>, page: i32) {
+        let full_text = preview_full_text.borrow().clone();
+        let (page_text, total_pages) = Self::paginate_text(&full_text, page, 300);
+        app_window.set_preview_text(page_text.into());
+        app_window.set_preview_current_page(page);
+        app_window.set_preview_total_pages(total_pages);
+    }
+
+    /// 处理最终产物分页改变
+    fn handle_final_page_changed(app_window: &AppWindow, final_full_text: &Rc<RefCell<String>>, page: i32) {
+        let full_text = final_full_text.borrow().clone();
+        let (page_text, total_pages) = Self::paginate_text(&full_text, page, 300);
+        app_window.set_final_product_text(page_text.into());
+        app_window.set_final_current_page(page);
+        app_window.set_final_total_pages(total_pages);
+    }
+
+    /// 处理上传回写文件（真正的非阻塞版本）
+    fn handle_upload_writeback_file(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, preview_full_text: &Rc<RefCell<String>>) {
+        Self::append_writeback_log(app_window, "📂 开始选择回写文件...");
+
+        // 打开文件选择对话框
+        let file_dialog = rfd::FileDialog::new()
+            .add_filter("JSON文件", &["json"])
+            .set_title("选择回写JSON文件");
+
+        if let Some(path) = file_dialog.pick_file() {
+            Self::append_writeback_log(app_window, &format!("📁 已选择文件: {}", path.display()));
+
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    Self::append_writeback_log(app_window, &format!("📖 文件读取成功，大小: {} 字节", content.len()));
+
+                    // 使用真正的后台线程处理，避免阻塞UI
+                    let app_window_weak = app_window.as_weak();
+
+                    // 在启动线程前提取所需数据
+                    let intermediate_stage2 = preview_full_text.borrow().clone();
+                    let original_file_path = app_state.borrow().original_file_path.clone();
+
+                    // 提取原始JSON数据用于更新
+                    let original_json = app_state.borrow().dom.clone();
+
+                    std::thread::spawn(move || {
+                        // 在后台线程中处理回写
+                        match Self::process_writeback_in_background(&content, &intermediate_stage2, original_json, original_file_path, &app_window_weak) {
+                            Ok(modified_count) => {
+                                // 使用invoke_from_event_loop安全地更新UI
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(app_window) = app_window_weak.upgrade() {
+                                        Self::append_writeback_log(&app_window, &format!("🎉 回写完成！共修改了 {} 个字段", modified_count));
+                                        app_window.set_status_message(format!("回写成功，修改了 {} 个字段", modified_count).into());
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                let error_msg = e.to_string();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(app_window) = app_window_weak.upgrade() {
+                                        Self::append_writeback_log(&app_window, &format!("❌ 回写失败: {}", error_msg));
+                                        app_window.set_status_message(format!("回写失败: {}", error_msg).into());
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    Self::append_writeback_log(app_window, &format!("❌ 文件读取失败: {}", e));
+                    app_window.set_status_message(format!("读取文件失败: {}", e).into());
+                }
+            }
+        } else {
+            Self::append_writeback_log(app_window, "⚠️ 用户取消了文件选择");
+            app_window.set_status_message("用户取消了文件选择".into());
+        }
+    }
+
+    /// 处理保存修改后的JSON
+    fn handle_save_modified_json(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        let file_dialog = rfd::FileDialog::new()
+            .add_filter("JSON文件", &["json"])
+            .set_title("保存修改后的JSON文件")
+            .set_file_name("modified.json");
+
+        if let Some(path) = file_dialog.save_file() {
+            match app_state.borrow().save_modified_json(&path) {
+                Ok(_) => {
+                    app_window.set_status_message(format!("文件已保存到: {}", path.display()).into());
+                }
+                Err(e) => {
+                    app_window.set_status_message(format!("保存失败: {}", e).into());
+                }
+            }
+        } else {
+            app_window.set_status_message("用户取消了保存".into());
+        }
+    }
+
+    /// 在后台线程中处理回写（真正的非阻塞版本）
+    fn process_writeback_in_background(
+        writeback_content: &str,
+        intermediate_stage2: &str,
+        mut original_json: Option<serde_json::Value>,
+        original_file_path: Option<PathBuf>,
+        app_window_weak: &slint::Weak<AppWindow>
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        // 更新日志的闭包（使用invoke_from_event_loop）
+        let update_log = |app_window_weak: &slint::Weak<AppWindow>, message: String| {
+            let app_window_weak_clone = app_window_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app_window) = app_window_weak_clone.upgrade() {
+                    Self::append_writeback_log(&app_window, &message);
+                }
+            });
+        };
+
+        update_log(app_window_weak, "🔍 开始解析回写文件...".to_string());
+
+        // 解析上传的回写文件
+        let writeback_data: serde_json::Value = serde_json::from_str(writeback_content)?;
+        let writeback_obj = writeback_data.as_object()
+            .ok_or("回写文件必须是JSON对象")?;
+
+        update_log(app_window_weak, format!("📊 回写文件包含 {} 个条目", writeback_obj.len()));
+
+        update_log(app_window_weak, "🔍 开始解析中间产物2...".to_string());
+        // 解析中间产物2
+        let stage2_data: serde_json::Value = serde_json::from_str(intermediate_stage2)?;
+        let items = stage2_data.get("items")
+            .and_then(|v| v.as_array())
+            .ok_or("中间产物2格式错误：缺少items数组")?;
+
+        update_log(app_window_weak, format!("📊 中间产物2包含 {} 个条目", items.len()));
+
+        let mut modified_count = 0;
+        let mut skipped_count = 0;
+        let total_entries = writeback_obj.len();
+
+        update_log(app_window_weak, format!("🔄 开始处理 {} 个回写条目...", total_entries));
+
+        // 确保有原始JSON数据
+        let json_data = original_json.as_mut()
+            .ok_or("缺少原始JSON数据")?;
+
+        // 处理每个回写条目
+        for (key, new_value) in writeback_obj.iter() {
+            // 每处理100个条目就更新进度
+            if (modified_count + skipped_count) % 100 == 0 {
+                let progress = ((modified_count + skipped_count) as f64 / total_entries as f64 * 100.0) as u32;
+                update_log(app_window_weak, format!("📊 进度: {}/{} ({}%)",
+                    modified_count + skipped_count + 1, total_entries, progress));
+            }
+
+            // 解析序号
+            let seq = match key.parse::<usize>() {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!("跳过无效序号: {}", key);
+                    skipped_count += 1;
+                    continue;
+                }
+            };
+
+            // 在中间产物2中找到对应的条目
+            if let Some(item) = items.get(seq) {
+                if let Some(source_path) = item.get("source_path").and_then(|v| v.as_str()) {
+                    // 验证新值格式
+                    let new_value_str = match new_value {
+                        serde_json::Value::String(s) => {
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() {
+                                skipped_count += 1;
+                                continue;
+                            }
+                            s.clone()
+                        },
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Null => {
+                            skipped_count += 1;
+                            continue;
+                        },
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            skipped_count += 1;
+                            continue;
+                        }
+                    };
+
+                    // 使用JSONPath更新原始JSON
+                    match Self::update_json_by_path(json_data, source_path, &new_value_str) {
+                        Ok(_) => {
+                            modified_count += 1;
+                        }
+                        Err(_) => {
+                            skipped_count += 1;
+                        }
+                    }
+                } else {
+                    skipped_count += 1;
+                }
+            } else {
+                skipped_count += 1;
+            }
+        }
+
+        update_log(app_window_weak, format!("📈 处理完成: 成功 {} 个，跳过 {} 个", modified_count, skipped_count));
+
+        // 保存到原始文件
+        if let Some(original_path) = original_file_path {
+            update_log(app_window_weak, "💾 开始保存到原始文件...".to_string());
+            let json_string = serde_json::to_string_pretty(json_data)?;
+            std::fs::write(&original_path, json_string)?;
+            update_log(app_window_weak, format!("✅ 已保存到: {}", original_path.display()));
+        }
+
+        Ok(modified_count)
+    }
+
+    /// 使用JSONPath更新JSON值（独立函数，不依赖AppState）
+    fn update_json_by_path(
+        json_data: &mut serde_json::Value,
+        json_path: &str,
+        new_value: &str
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use jsonpath_rust::{JsonPath, query::queryable::Queryable};
+
+        // 查找路径
+        let paths: Vec<String> = json_data
+            .query_only_path(json_path)
+            .map_err(|e| format!("JSONPath查询失败: {}", e))?;
+
+        let Some(p) = paths.into_iter().next() else {
+            return Err(format!("JSONPath未匹配到可更新路径: {}", json_path).into());
+        };
+
+        // 通过 reference_mut 按路径获取可变引用
+        if let Some(slot) = json_data.reference_mut(&p) {
+            *slot = serde_json::Value::String(new_value.to_string());
+        } else {
+            return Err(format!("路径不可更新: {}", p).into());
+        }
+
+        Ok(())
+    }
+}
+
+
+fn main() {
+    // 初始化日志输出（遵循 message_：可观测性）
+    let _ = SubscriberBuilder::default()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
+    let app = AppWindow::new().expect("UI 初始化失败");
+    let state = Rc::new(RefCell::new(AppState::default()));
+
+    // 创建VM桥接器并绑定UI回调
+    let bridge = ViewModelBridge::new(&app, state.clone());
+    bridge.initialize_ui(&app);
+
+    tracing::info!("应用启动成功，UI已初始化");
+    app.run().unwrap();
+}
+

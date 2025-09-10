@@ -1,0 +1,747 @@
+// JSON翻译工具主窗口：三分栏布局（树视图、预览区、粘贴区）
+// 遵循xqwn需求：支持大文件JSON树导航、节点提取、精确回写
+
+import { Button, ScrollView, ListView, TextEdit, ProgressIndicator } from "std-widgets.slint";
+
+// 树节点数据结构（与Rust shadow_tree::JsonTreeNode对应）
+struct TreeNodeData {
+    name: string,           // 节点名称（字段名或数组索引）
+    path: string,           // JSONPath路径
+    kind: string,           // 节点类型：Object/Array/String/Number/Bool/Null
+    children: int,          // 子节点数量
+    preview: string,        // 节点预览文本
+    depth: int,             // 节点深度（用于缩进显示）
+    expanded: bool,         // 是否展开（用于折叠/展开功能）
+    visible: bool,          // 是否可见（保留字段，但在Rust端过滤）
+}
+
+// 搜索结果列表项（用于中间面板：列表+单条详情）
+struct SearchItemData {
+    name: string,
+    path: string,
+    kind: string,
+}
+
+// 终端风格按钮组件
+component TerminalButton inherits Rectangle {
+    in property<string> text;
+    in property<bool> enabled: true;
+    callback clicked;
+
+    height: 32px;
+    background: transparent;
+    border-width: 0px;
+
+    touch_area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: "[ " + root.text + " ]";
+        font-family: "JetBrains Mono";
+        font-size: 13px;
+        color: root.enabled ? (touch_area.has_hover ? #39FF14 : #C9D1D9) : #6E7681;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+
+export component AppWindow inherits Window {
+    title: "JSON 翻译工具";
+    in property<[SearchItemData]> search_results: [];          // 搜索结果（仅元数据列表）
+
+    width: 1400px;          // 进一步增加宽度以确保右侧区域完整显示
+    height: 1000px;         // 进一步增加高度以确保所有内容完整显示
+    background: background_primary;
+
+    // === 状态属性 ===
+    in property<string> current_path: "";                    // 当前打开的文件路径
+    in property<[TreeNodeData]> tree_model: [];              // 树视图数据模型
+    in property<string> preview_text: "";                    // 预览区文本（中间产物 第二阶段）
+    in-out property<string> paste_text: "";                  // 粘贴区文本
+    in property<string> selected_json_path: "";              // 当前选中节点的JSONPath/阶段提示
+    in property<string> status_message: "就绪";              // 状态栏消息
+    in property<string> performance_info: "";               // 性能信息
+    in-out property<string> search_filter: "";              // 搜索过滤文本
+    in-out property<string> final_product_text: "";          // 最终产物文本（第三阶段）
+
+    // === 分页相关属性 ===
+    in property<int> preview_current_page: 1;               // 中间产物当前页码
+    in property<int> preview_total_pages: 1;                // 中间产物总页数
+    in property<int> final_current_page: 1;                 // 最终产物当前页码
+    in property<int> final_total_pages: 1;                  // 最终产物总页数
+
+    // === 进度条属性 ===
+    in-out property<float> progress_value: 0.0;             // 进度值 (0.0-1.0)
+    in-out property<string> progress_text: "";              // 进度文本
+    in-out property<bool> progress_visible: false;          // 进度条是否可见
+
+    // === 回写日志属性 ===
+    in-out property<string> writeback_log: "";              // 回写过程日志
+
+    // === 回调函数 ===
+    callback load_file();                                    // 加载文件
+    callback node_selected(string);                         // 节点被选中
+    callback copy_pressed();                                 // 复制按钮
+    callback write_back_pressed();                           // 回写按钮
+    callback search_changed(string);                        // 搜索过滤改变
+    callback toggle_node_expanded(string);                  // 切换节点展开状态
+    callback one_click_final_product();                      // 一键获得最终产物按钮
+    callback search_item_selected(string);                  // 列表项被选中（中间产物 第一阶段）
+    callback copy_all_pressed();                             // 生成中间产物 第二阶段（不复制到剪贴板）
+    callback transform_pressed();                            // 将中间产物2转换为最终产物
+    callback copy_final_pressed();                           // 复制最终产物到剪贴板
+    callback preview_page_changed(int);                      // 中间产物分页改变
+    callback final_page_changed(int);                        // 最终产物分页改变
+    callback upload_writeback_file();                        // 上传回写文件
+    callback save_modified_json();                           // 保存修改后的JSON
+    callback clear_writeback_log();                          // 清空回写日志
+
+    // === 进度条控制函数 ===
+    public function show_progress(text: string) {
+        progress_text = text;
+        progress_value = 0.0;
+        progress_visible = true;
+        debug("Slint函数: show_progress 被调用, progress_visible设为true");
+    }
+
+    public function update_progress(value: float, text: string) {
+        progress_value = value;
+        progress_text = text;
+        debug("Slint函数: update_progress 被调用, value=" + value);
+    }
+
+    public function hide_progress() {
+        progress_visible = false;
+        progress_value = 0.0;
+        progress_text = "";
+        debug("Slint函数: hide_progress 被调用, progress_visible设为false");
+    }
+
+    // === 测试函数 ===
+    public function test_progress() {
+        debug("测试函数: 开始测试进度条");
+        progress_visible = true;
+        progress_text = "测试进度条";
+        progress_value = 0.5;
+        debug("测试函数: progress_visible=" + (progress_visible ? "true" : "false") + ", text=" + progress_text);
+    }
+
+    // === 常量定义（消除魔法值） ===
+    property<length> header_height: 40px;
+    property<length> status_height: 30px;
+    property<length> button_height: 32px;
+    property<length> panel_spacing: 8px;
+    property<length> content_padding: 12px;
+
+    // === 终端风格字体 ===
+    property<string> terminal_font: "JetBrains Mono";
+
+    // === 终端风格深色主题 ===
+    property<color> background_primary: #0D1117;      // 深黑终端背景
+    property<color> background_secondary: #161B22;    // 次要终端背景
+    property<color> background_tertiary: #21262D;     // 第三终端背景
+    property<color> accent_color: #39FF14;            // 荧光绿高亮色
+    property<color> text_primary: #E6EDF3;            // 主要文字（淡银色）
+    property<color> text_secondary: #C9D1D9;          // 次要文字
+    property<color> text_tertiary: #8B949E;           // 第三级文字（性能信息）
+    property<color> text_muted: #6E7681;              // 静音文字
+    property<color> border_color: #30363D;            // 边框颜色
+    property<color> button_primary: #39FF14;          // 主按钮（荧光绿）
+    property<color> button_secondary: #30363D;        // 次按钮
+    property<color> button_success: #39FF14;          // 成功按钮
+    property<color> button_danger: #F85149;           // 危险按钮
+    property<color> hover_overlay: #30363D;           // 悬停覆盖
+
+    VerticalLayout {
+        spacing: 0;
+
+        // === 顶部工具栏 ===
+        Rectangle {
+            height: 80px;  // 固定高度以容纳双行布局
+            background: background_secondary;
+            border-width: 1px;
+            border-color: border_color;
+
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+
+                // 第一行：文件操作和状态
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: space-between;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: start;
+
+                        TerminalButton {
+                            text: "打开文件";
+                            height: button_height;
+                            clicked => { load_file(); }
+                        }
+
+                        TerminalButton {
+                            text: "一键获得最终产物";
+                            height: button_height;
+                            enabled: current_path != "";
+                            clicked => { one_click_final_product(); }
+                        }
+
+                        TerminalButton {
+                            text: "复制最终参悟";
+                            height: button_height;
+                            enabled: final_product_text != "";
+                            clicked => { copy_final_pressed(); }
+                        }
+                    }
+
+                    Text {
+                        text: current_path == "" ? "[ 未打开文件 ]" : "[ " + current_path + " ]";
+                        font-size: 13px;
+                        font-family: terminal_font;
+                        color: current_path == "" ? text_muted : accent_color;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 第二行：搜索功能
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text {
+                        text: "搜索:";
+                        font-size: 13px;
+                        font-family: terminal_font;
+                        color: accent_color;
+                        vertical-alignment: center;
+                        min-width: 40px;
+                    }
+
+                    Rectangle {
+                        width: 200px;
+                        height: 28px;
+                        background: background_primary;
+                        border-width: 1px;
+                        border-color: search_filter == "" ? border_color : accent_color;
+                        border-radius: 2px;
+
+                        TextInput {
+                            text <=> search_filter;
+                            font-size: 12px;
+                            font-family: terminal_font;
+                            color: text_primary;
+                            edited => { search_changed(self.text); }
+                            single-line: true;
+                        }
+                    }
+
+                    if search_filter != "": TouchArea {
+                        width: 24px;
+                        height: 24px;
+                        clicked => {
+                            search_filter = "";
+                            search_changed("");
+                        }
+
+                        Rectangle {
+                            background: clear_touch_area.has_hover ? hover_overlay : transparent;
+                            border-radius: 2px;
+
+                            Text {
+                                text: "✕";
+                                font-size: 12px;
+                                font-family: terminal_font;
+                                color: clear_touch_area.has_hover ? accent_color : text_muted;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+
+                            clear_touch_area := TouchArea {}
+                        }
+                    }
+                }
+            }
+        }
+        // === 主内容区：三分栏布局 ===
+        HorizontalLayout {
+            spacing: panel_spacing;
+            padding: content_padding;
+
+            // === 左侧：JSON树视图 ===
+            Rectangle {
+                width: 25%;
+                background: background_secondary;
+                border-width: 1px;
+                border-color: border_color;
+                border-radius: 4px;
+
+                // 优化：启用渲染缓存，减少大数据集重绘开销
+                cache-rendering-hint: true;
+
+                VerticalLayout {
+                    padding: content_padding;
+                    spacing: panel_spacing;
+
+                    Text {
+                        text: "JSON 结构树";
+                        font-size: 16px;
+                        font-family: terminal_font;
+                        font-weight: 600;
+                        color: accent_color;
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: border_color;
+                    }
+
+                    ScrollView {
+                        ListView {
+                            for node in tree_model: Rectangle {
+                                height: 24px;
+                                background: touch_area.has_hover ? hover_overlay : transparent;
+                                border-radius: 2px;
+
+                                // 优化：为每个树节点启用渲染缓存
+                                cache-rendering-hint: true;
+
+                                touch_area := TouchArea {
+                                    clicked => {
+                                        node_selected(node.path);
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: 8px + (node.depth * 16px); // 根据深度缩进
+                                    padding-right: 8px;
+                                    spacing: 4px;
+                                    alignment: start;
+
+                                    // 展开/折叠按钮
+                                    if node.children > 0: expand_area := TouchArea {
+                                        width: 20px;
+                                        height: 20px;
+                                        clicked => { toggle_node_expanded(node.path); }
+
+                                        Rectangle {
+                                            background: expand_area.has_hover ? hover_overlay : transparent;
+                                            border-radius: 2px;
+
+                                            Text {
+                                                text: node.expanded ? "[-]" : "[+]";
+                                                font-size: 11px;
+                                                font-family: terminal_font;
+                                                color: expand_area.has_hover ? accent_color : text_secondary;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                            }
+                                        }
+                                    }
+
+                                    // 占位符（保持对齐）
+                                    if node.children == 0: Rectangle {
+                                        width: 20px;
+                                        height: 20px;
+                                    }
+
+                                    // 节点类型图标
+                                    Text {
+                                        text: node.kind == "Object" ? "📁" :
+                                              node.kind == "Array" ? "📋" :
+                                              node.kind == "String" ? "📝" :
+                                              node.kind == "Number" ? "🔢" :
+                                              node.kind == "Bool" ? "☑️" : "⚪";
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+
+                                    // 节点名称
+                                    Text {
+                                        text: node.name;
+                                        font-size: 13px;
+                                        font-family: terminal_font;
+                                        vertical-alignment: center;
+                                        color: selected_json_path == node.path ? accent_color : text_primary;
+                                        font-weight: selected_json_path == node.path ? 600 : 400;
+                                        min-width: 80px;
+                                    }
+
+                                    // 分隔符
+                                    Text {
+                                        text: ":";
+                                        font-size: 13px;
+                                        font-family: terminal_font;
+                                        color: text_muted;
+                                        vertical-alignment: center;
+                                    }
+
+                                    // 节点值预览
+                                    Text {
+                                        text: node.preview;
+                                        font-size: 12px;
+                                        font-family: terminal_font;
+                                        color: node.kind == "String" ? #98fb98 :  // 浅绿色字符串
+                                               node.kind == "Number" ? #87ceeb :  // 浅蓝色数字
+                                               node.kind == "Bool" ? #dda0dd :    // 浅紫色布尔值
+                                               text_secondary;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    // 子节点数量提示
+                                    if node.children > 0: Text {
+                                        text: "(" + node.children + ")";
+                                        font-size: 11px;
+                                        font-family: terminal_font;
+                                        color: text_muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // === 中间：预览区 ===
+            Rectangle {
+                width: 30%;
+                background: background_secondary;
+                border-width: 1px;
+                border-color: border_color;
+                border-radius: 4px;
+
+                VerticalLayout {
+                    padding: content_padding;
+                    spacing: panel_spacing;
+
+                    HorizontalLayout {
+                        spacing: panel_spacing;
+                        alignment: space-between;
+
+                        Text {
+                            text: "节点预览";
+                            font-size: 16px;
+                            font-family: terminal_font;
+                            font-weight: 600;
+                            color: accent_color;
+                        }
+
+
+                    }
+
+                    Rectangle { height: 1px; background: border_color; }
+
+                    if selected_json_path != "": Text {
+                        text: "路径: " + selected_json_path;
+                        font-size: 12px;
+                        font-family: terminal_font;
+                        color: accent_color;
+                    }
+
+                    // 上半区：匹配项列表（可滚动）
+                    ScrollView {
+                        ListView {
+                            for item in search_results : Rectangle {
+                                height: 28px;
+                                background: background_secondary;
+
+                                // 优化：为搜索结果项启用渲染缓存
+                                cache-rendering-hint: true;
+                                HorizontalLayout {
+                                    padding-left: 6px;
+                                    spacing: 6px;
+                                    Text { text: item.kind + ":"; color: text_secondary; font-size: 11px; }
+                                    Text { text: item.path; color: text_primary; font-size: 12px; }
+                                }
+                                TouchArea { clicked => { search_item_selected(item.path); } }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: border_color; }
+
+                    // 下半区：中间产物 第二阶段（由“生成中间产物2”产生）
+                    HorizontalLayout {
+                        spacing: panel_spacing;
+                        alignment: space-between;
+                        Text { text: "中间产物 第二阶段"; font-size: 12px; color: text_muted; }
+                        if preview_total_pages > 1: HorizontalLayout {
+                            spacing: 4px;
+                            Button {
+                                text: "上一页";
+                                height: 24px;
+                                enabled: preview_current_page > 1;
+                                clicked => { preview_page_changed(preview_current_page - 1); }
+                            }
+                            Text {
+                                text: preview_current_page + "/" + preview_total_pages;
+                                font-size: 11px;
+                                color: text_secondary;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "下一页";
+                                height: 24px;
+                                enabled: preview_current_page < preview_total_pages;
+                                clicked => { preview_page_changed(preview_current_page + 1); }
+                            }
+                        }
+                    }
+                    ScrollView {
+                        min-height: 180px;
+                        Rectangle {
+                            background: background_primary;
+                            border-width: 1px;
+                            border-color: border_color;
+                            border-radius: 2px;
+
+                            VerticalLayout {
+                                padding: 8px;
+
+                                Text {
+                                    text: preview_text;
+                                    font-size: 12px;
+                                    font-family: terminal_font;
+                                    color: text_primary;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: border_color; }
+
+                    // 中间产物 第三阶段（转换为最终结果）
+                    HorizontalLayout {
+                        spacing: panel_spacing;
+                        alignment: space-between;
+                        Text { text: "最终产物"; font-size: 12px; color: text_muted; }
+                        if final_total_pages > 1: HorizontalLayout {
+                            spacing: 4px;
+                            Button {
+                                text: "上一页";
+                                height: 24px;
+                                enabled: final_current_page > 1;
+                                clicked => { final_page_changed(final_current_page - 1); }
+                            }
+                            Text {
+                                text: final_current_page + "/" + final_total_pages;
+                                font-size: 11px;
+                                color: text_secondary;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "下一页";
+                                height: 24px;
+                                enabled: final_current_page < final_total_pages;
+                                clicked => { final_page_changed(final_current_page + 1); }
+                            }
+                        }
+                    }
+                    ScrollView {
+                        min-height: 120px;
+                        Rectangle {
+                            background: background_primary;
+                            border-width: 1px;
+                            border-color: border_color;
+                            border-radius: 2px;
+
+                            VerticalLayout {
+                                padding: 8px;
+
+                                Text {
+                                    text: final_product_text;
+                                    font-size: 12px;
+                                    font-family: terminal_font;
+                                    color: text_primary;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // === 右侧：粘贴与回写区 ===
+            Rectangle {
+                width: 42%;
+                background: background_secondary;
+                border-width: 1px;
+                border-color: border_color;
+                border-radius: 4px;
+
+                VerticalLayout {
+                    padding: content_padding;
+                    spacing: panel_spacing;
+
+                    VerticalLayout {
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            TerminalButton {
+                                text: "上传回写文件";
+                                height: button_height;
+                                clicked => { upload_writeback_file(); }
+                            }
+                            TerminalButton {
+                                text: "保存修改";
+                                height: button_height;
+                                enabled: paste_text != "";
+                                clicked => { save_modified_json(); }
+                            }
+                            TerminalButton {
+                                text: "回写";
+                                height: button_height;
+                                enabled: paste_text != "" && selected_json_path != "";
+                                clicked => { write_back_pressed(); }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: border_color;
+                    }
+
+                    VerticalLayout {
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: space-between;
+
+                            Text {
+                                text: "回写日志";
+                                font-size: 14px;
+                                font-family: terminal_font;
+                                font-weight: 600;
+                                color: accent_color;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 4px;
+
+                                TerminalButton {
+                                    text: "测试日志";
+                                    height: 24px;
+                                    clicked => {
+                                        writeback_log = "[测试] 这是一条测试日志\n" + writeback_log;
+                                    }
+                                }
+
+                                TerminalButton {
+                                    text: "清空日志";
+                                    height: 24px;
+                                    clicked => { clear_writeback_log(); }
+                                }
+                            }
+                        }
+
+                        ScrollView {
+                            min-height: 180px;
+                            // max-height: 100;
+                            viewport-height: log_text.preferred-height;
+                            vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                            horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+
+                            Rectangle {
+                                background: #1a1a1a;
+                                border-radius: 2px;
+
+                                log_text := Text {
+                                    text: writeback_log;
+                                    font-size: 11px;
+                                    wrap: TextWrap.word-wrap;
+                                    color: #00ff00;
+                                    vertical-alignment: top;
+                                    horizontal-alignment: left;
+                                    width: parent.width;
+                                    x: 8px;
+                                    y: 8px;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // === 底部状态栏 ===
+        Rectangle {
+            height: status_height;
+            background: background_tertiary;
+            border-width: 1px;
+            border-color: border_color;
+
+            HorizontalLayout {
+                padding-left: content_padding;
+                padding-right: content_padding;
+                spacing: 12px;
+                alignment: start;
+
+                // 左侧：状态消息
+                Text {
+                    text: "状态: " + status_message + " █ [进度:" + (progress_visible ? "显示" : "隐藏") + "]";
+                    font-size: 12px;
+                    font-family: terminal_font;
+                    color: accent_color;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+
+                // 中间：进度条区域（使用标准ProgressIndicator组件）
+                HorizontalLayout {
+                    width: 280px;
+                    height: parent.height;
+                    spacing: 8px;
+                    alignment: center;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    visible: progress_visible;  // 使用 visible 属性而不是条件渲染
+
+                    Text {
+                        text: progress_text;
+                        font-size: 11px;
+                        font-family: terminal_font;
+                        color: text_primary;
+                        vertical-alignment: center;
+                        max-width: 120px;
+                    }
+
+                    ProgressIndicator {
+                        progress: progress_value;
+                        width: 100px;
+                        height: 12px;
+                    }
+
+                    Text {
+                        text: Math.round(progress_value * 100) + "%";
+                        font-size: 11px;
+                        font-family: terminal_font;
+                        color: text_secondary;
+                        vertical-alignment: center;
+                        width: 35px;
+                    }
+                }
+
+                // 右侧：性能信息（自动填充剩余空间）
+                Text {
+                    text: performance_info != "" ? "| " + performance_info + " | UTF-8" : "| UTF-8";
+                    font-size: 11px;
+                    font-family: terminal_font;
+                    color: text_tertiary;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+}
