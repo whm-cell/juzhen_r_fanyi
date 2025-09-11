@@ -286,8 +286,6 @@ jobs:
       run: |
         cat > release_notes.md << 'EOF'
         
-        # JSON翻译工具 ${{ github.ref_name }} 发布说明
-
         优化自动化构建流程
 
         ---

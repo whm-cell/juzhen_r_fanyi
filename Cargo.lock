@@ -2353,6 +2353,7 @@ dependencies = [
  "anyhow",
  "copypasta",
  "jsonpath-rust",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

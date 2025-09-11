@@ -30,6 +30,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 anyhow = { version = "1.0", default-features = false }
 # 文件对话框
 rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
+# 正则表达式
+regex = { version = "1.10", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3.0"

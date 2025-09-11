@@ -91,6 +91,9 @@ export component AppWindow inherits Window {
     in-out property<string> tree_char_filter: "all";         // 字符过滤模式: "all", "chinese", "english"
     in-out property<bool> tree_hide_empty: false;            // 是否隐藏空值
 
+    // === 智能英文字段检测属性 ===
+    in property<[string]> english_fields: [];                // 检测到的英文字段列表
+
     // === 回调函数 ===
     callback load_file();                                    // 加载文件
     callback node_selected(string);                         // 节点被选中
@@ -114,6 +117,9 @@ export component AppWindow inherits Window {
     callback toggle_tree_flatten();                          // 切换扁平化显示
     callback set_tree_char_filter(string);                   // 设置字符过滤模式
     callback toggle_tree_hide_empty();                       // 切换隐藏空值
+    callback detect_english_fields();                        // 检测英文字段
+    callback apply_search_filter(string);                    // 应用搜索过滤
+    callback extract_search_results(string);                 // 提取搜索结果
 
     // === 进度条控制函数 ===
     public function show_progress(text: string) {
@@ -278,6 +284,72 @@ export component AppWindow inherits Window {
                             }
 
                             clear_touch_area := TouchArea {}
+                        }
+                    }
+
+                    // 智能英文字段检测区域 - 父级滚动容器
+                    if english_fields.length > 0: ScrollView {
+                        // 固定宽度，当内容超出时启用滚动
+                        width: 500px;
+                        height: 28px;
+                        viewport-width: max(500px, 70px + english_fields.length * 85px);
+                        viewport-height: 28px;
+                        // 启用鼠标拖拽滚动
+                        mouse-drag-pan-enabled: true;
+                        // 隐藏滚动条但保留滚动功能
+                        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                        Rectangle {
+                            // 内容宽度根据标签数量动态调整
+                            width: 70px + english_fields.length * 85px;
+                            height: 28px;
+                            background: background_secondary;
+                            border-width: 1px;
+                            border-color: border_color;
+                            border-radius: 2px;
+
+                            HorizontalLayout {
+                                padding: 4px;
+                                spacing: 4px;
+                                alignment: start;
+
+                                // 标签容器 - 直接布局，无嵌套滚动
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    alignment: start;
+
+                                    // 英文字段标签
+                                    for field[index] in english_fields: Rectangle {
+                                        width: 80px;
+                                        height: 20px;
+                                        background: english_field_touch_area.has_hover ? accent_color : background_primary;
+                                        border-width: 1px;
+                                        border-color: accent_color;
+                                        border-radius: 10px;
+
+                                        Text {
+                                            text: field;
+                                            font-size: 10px;
+                                            font-family: terminal_font;
+                                            color: english_field_touch_area.has_hover ? background_primary : accent_color;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+
+                                        english_field_touch_area := TouchArea {
+                                            clicked => {
+                                                // 先设置搜索框的值
+                                                search_filter = field;
+                                                // 然后执行搜索相关操作
+                                                search_changed(field);
+                                                // 最后执行一键获取最终产物
+                                                one_click_final_product();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

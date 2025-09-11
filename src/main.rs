@@ -291,6 +291,39 @@ impl ViewModelBridge {
                 }
             });
         }
+
+        // === 智能英文字段检测回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_detect_english_fields(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_detect_english_fields(&app_window, &app_state);
+                }
+            });
+        }
+
+        // === 应用搜索过滤回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_apply_search_filter(move |filter| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_apply_search_filter(&app_window, &app_state, &filter.to_string());
+                }
+            });
+        }
+
+        // === 提取搜索结果回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_extract_search_results(move |filter| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_extract_search_results(&app_window, &app_state, &filter.to_string());
+                }
+            });
+        }
     }
 
     /// 初始化UI状态
@@ -397,6 +430,9 @@ impl ViewModelBridge {
                 app_window.set_status_message(STATUS_LOADED.into());
                 tracing::info!("文件加载成功: {} 个节点，耗时: {:.2}ms",
                     node_count, load_duration.as_millis());
+
+                // 自动检测英文字段
+                Self::handle_detect_english_fields(app_window, app_state);
             }
             Err(e) => {
                 let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
@@ -1554,6 +1590,62 @@ impl ViewModelBridge {
                 preview.trim() == "{}"
             },
             _ => false
+        }
+    }
+
+    /// 处理智能英文字段检测
+    fn handle_detect_english_fields(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        match app_state.borrow().detect_english_fields() {
+            Ok(english_fields) => {
+                // 转换为Slint可用的字符串数组
+                let slint_fields: Vec<slint::SharedString> = english_fields
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect();
+
+                // 设置到UI
+                let field_count = slint_fields.len();
+                let model = ModelRc::new(VecModel::from(slint_fields));
+                app_window.set_english_fields(model);
+
+                app_window.set_status_message(format!("检测到 {} 个英文字段", field_count).into());
+
+                tracing::info!("英文字段检测完成，找到 {} 个字段", field_count);
+            }
+            Err(e) => {
+                let error_msg = format!("{}英文字段检测失败: {}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("英文字段检测失败: {}", e);
+            }
+        }
+    }
+
+    /// 处理应用搜索过滤
+    fn handle_apply_search_filter(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, filter: &str) {
+        // 直接调用现有的搜索处理函数
+        Self::handle_search_changed(app_window, app_state, filter);
+    }
+
+    /// 处理提取搜索结果
+    fn handle_extract_search_results(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, filter: &str) {
+        if filter.trim().is_empty() {
+            app_window.set_status_message("错误: 搜索条件为空".into());
+            return;
+        }
+
+        match app_state.borrow().extract_search_results(filter) {
+            Ok(search_results) => {
+                app_window.set_preview_text(search_results.into());
+                app_window.set_selected_json_path(format!("搜索结果: {}", filter).into());
+                app_window.set_status_message(format!("已提取搜索结果: {}", filter).into());
+
+                tracing::info!("搜索结果提取成功: {}", filter);
+            }
+            Err(e) => {
+                let error_msg = format!("{}搜索结果提取失败: {}", STATUS_ERROR_PREFIX, e);
+                app_window.set_status_message(error_msg.into());
+                tracing::error!("搜索结果提取失败: {}", e);
+            }
         }
     }
 }

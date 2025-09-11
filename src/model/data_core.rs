@@ -6,6 +6,8 @@ use jsonpath_rust::{JsonPath, query::queryable::Queryable}; // 提供 query/quer
 use serde_json::Value;
 use thiserror::Error;
 
+use std::collections::HashSet;
+
 use crate::model::shadow_tree::build_shadow_tree;
 use crate::utils::fs::{read_json_file, write_json_file};
 
@@ -428,6 +430,227 @@ impl AppState {
                     }
                 }
             }
+        }
+    }
+
+    /// 智能检测JSON中的英文字段，返回纯英文的字段值列表
+    pub fn detect_english_fields(&self) -> Result<Vec<String>, AppError> {
+        let dom = self
+            .dom
+            .as_ref()
+            .ok_or_else(|| AppError::State("DOM尚未加载".into()))?;
+
+        let mut english_fields = HashSet::new();
+
+        // 递归遍历JSON值，提取英文属性名
+        self.extract_english_keys(dom, &mut english_fields);
+
+        // 转换为排序的向量，过滤掉不符合条件的字段
+        let mut result: Vec<String> = english_fields
+            .into_iter()
+            .filter(|s| {
+                let trimmed = s.trim();
+                // 基本长度检查
+                if trimmed.len() < 2 || trimmed.len() > 50 {
+                    return false;
+                }
+
+                // 使用更精确的英文检测逻辑
+                Self::is_pure_english_field(trimmed)
+            })
+            .collect();
+
+        result.sort();
+        result.dedup(); // 去重
+
+        // 限制返回数量，避免UI过载
+        if result.len() > 20 {
+            result.truncate(20);
+        }
+
+        Ok(result)
+    }
+
+    /// 判断是否为纯英文字段名（排除时间格式、数字等）
+    fn is_pure_english_field(s: &str) -> bool {
+        // 必须包含至少一个英文字母
+        let has_letter = s.chars().any(|c| c.is_ascii_alphabetic());
+        if !has_letter {
+            return false;
+        }
+
+        // 排除时间格式 (如: "2023-01-01", "12:34:56", "2023-01-01T12:34:56Z")
+        if Self::is_time_format(s) {
+            return false;
+        }
+
+        // 排除版本号格式 (如: "v1.2.3", "1.0.0")
+        if Self::is_version_format(s) {
+            return false;
+        }
+
+        // 排除主要包含数字的字符串 (如: "123abc")
+        let letter_count = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let digit_count = s.chars().filter(|c| c.is_ascii_digit()).count();
+        if digit_count > letter_count {
+            return false;
+        }
+
+        // 只允许英文字母、下划线、连字符（不允许数字、冒号等）
+        s.chars().all(|c| c.is_ascii_alphabetic() || c == '_' || c == '-')
+    }
+
+    /// 判断是否为时间格式（优化版本，避免正则表达式性能问题）
+    fn is_time_format(s: &str) -> bool {
+        let len = s.len();
+
+        // 快速长度检查
+        if len < 8 || len > 30 {
+            return false;
+        }
+
+        // 检查是否包含时间相关字符
+        let has_time_chars = s.contains('-') || s.contains(':') || s.contains('T') || s.contains('Z');
+        if !has_time_chars {
+            return false;
+        }
+
+        // 简单模式匹配，避免复杂正则表达式
+        // ISO 8601 格式: 2023-01-01T12:34:56
+        if s.contains('T') && s.contains('-') && s.contains(':') {
+            return true;
+        }
+
+        // 日期格式: 2023-01-01
+        if s.matches('-').count() == 2 && len >= 8 && len <= 12 {
+            let parts: Vec<&str> = s.split('-').collect();
+            if parts.len() == 3 &&
+               parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit()) &&
+               parts[1].len() == 2 && parts[1].chars().all(|c| c.is_ascii_digit()) &&
+               parts[2].len() == 2 && parts[2].chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+
+        // 时间格式: 12:34:56
+        if s.matches(':').count() == 2 && len >= 6 && len <= 10 {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// 判断是否为版本号格式（优化版本，避免正则表达式性能问题）
+    fn is_version_format(s: &str) -> bool {
+        let len = s.len();
+
+        // 快速长度检查
+        if len < 3 || len > 20 {
+            return false;
+        }
+
+        // 检查是否包含点号
+        if !s.contains('.') {
+            return false;
+        }
+
+        // 移除可能的v前缀
+        let version_str = if s.starts_with('v') || s.starts_with('V') {
+            &s[1..]
+        } else {
+            s
+        };
+
+        // 检查点号数量（1-3个点号是合理的版本号）
+        let dot_count = version_str.matches('.').count();
+        if dot_count < 1 || dot_count > 3 {
+            return false;
+        }
+
+        // 检查是否为数字.数字格式
+        let parts: Vec<&str> = version_str.split('.').collect();
+        if parts.len() >= 2 && parts.len() <= 4 {
+            // 所有部分都应该是数字
+            return parts.iter().all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+        }
+
+        false
+    }
+
+    /// 判断是否为URL格式（优化版本，避免正则表达式性能问题）
+    fn is_url_format(s: &str) -> bool {
+        let len = s.len();
+
+        // 快速长度检查
+        if len < 7 || len > 2000 {  // 最短的URL如 http://a 至少7个字符
+            return false;
+        }
+
+        // 检查是否以常见协议开头
+        let lower_s = s.to_lowercase();
+        if lower_s.starts_with("http://") ||
+           lower_s.starts_with("https://") ||
+           lower_s.starts_with("ftp://") ||
+           lower_s.starts_with("ftps://") {
+            // 检查协议后是否有域名部分
+            let protocol_end = if lower_s.starts_with("https://") || lower_s.starts_with("ftps://") {
+                8
+            } else {
+                7
+            };
+
+            if s.len() > protocol_end {
+                let domain_part = &s[protocol_end..];
+                // 域名部分应该包含至少一个点或者是localhost
+                return domain_part.contains('.') || domain_part.starts_with("localhost");
+            }
+        }
+
+        false
+    }
+
+    /// 递归提取JSON中的英文属性名（键名），只收集值为字符串且值不是时间格式的属性名
+    /// 对于URL类型的属性值，直接提取URL本身而不是属性名
+    fn extract_english_keys(
+        &self,
+        value: &Value,
+        english_fields: &mut HashSet<String>,
+    ) {
+        match value {
+            Value::Array(arr) => {
+                for item in arr {
+                    self.extract_english_keys(item, english_fields);
+                }
+            }
+            Value::Object(obj) => {
+                for (key, val) in obj {
+                    // 只有当属性值是字符串且不是时间格式时，才收集键名或URL
+                    if let Value::String(string_value) = val {
+                        let trimmed_key = key.trim();
+                        let trimmed_value = string_value.trim();
+
+                        // 检查属性值是否为时间格式或版本号格式
+                        if !trimmed_key.is_empty() &&
+                           !Self::is_time_format(trimmed_value) &&
+                           !Self::is_version_format(trimmed_value) {
+                            // 如果属性值是URL，直接提取URL本身
+                            if Self::is_url_format(trimmed_value) {
+                                english_fields.insert(trimmed_value.to_string());
+                            } else {
+                                // 否则提取属性名
+                                english_fields.insert(trimmed_key.to_string());
+                            }
+                        }
+                    }
+
+                    // 递归检查子结构的键名（无论值是什么类型）
+                    self.extract_english_keys(val, english_fields);
+                }
+            }
+            _ => {} // 忽略其他类型（数字、布尔值、null、字符串值）
         }
     }
 }
