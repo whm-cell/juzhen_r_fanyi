@@ -37,10 +37,6 @@ tempfile = "3.0"
 [build-dependencies]
 slint-build = "1.13.0"
 
-[[example]]
-name = "performance_benchmark"
-path = "examples/performance_benchmark.rs"
-
 # 优化配置：大幅减少二进制文件大小
 [profile.release]
 # 优化级别：'z' 为最小体积优化
