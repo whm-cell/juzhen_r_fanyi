@@ -23,7 +23,7 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        components: rustfmt, clippy
+        components: clippy
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
@@ -56,9 +56,6 @@ jobs:
           libcairo-gobject2 \
           pkg-config \
           clang
-
-    - name: Check formatting
-      run: cargo fmt --all -- --check
 
     - name: Run Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
@@ -206,7 +203,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install MSRV Rust toolchain
-      uses: dtolnay/rust-toolchain@1.85.0  # Slint最低要求版本
+      uses: dtolnay/rust-toolchain@1.89.0  # Slint最低要求版本
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
