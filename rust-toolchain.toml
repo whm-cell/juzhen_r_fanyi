@@ -1,0 +1,10 @@
+[toolchain]
+# Slint UI框架要求的最低Rust版本
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin", 
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu"
+]
