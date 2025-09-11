@@ -1,0 +1,58 @@
+[package]
+name = "juzhen_r_fanyi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "juzhen_r_fanyi"
+path = "src/main.rs"
+
+[lib]
+name = "juzhen_r_fanyi"
+path = "src/lib.rs"
+
+[dependencies]
+# Slint UI框架 - 包含必要的后端和渲染器
+slint = { version = "1.13.0", default-features = false, features = ["renderer-skia", "compat-1-2", "backend-default"] }
+# JSON序列化 - 只启用derive功能
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.143", default-features = false }
+# JSONPath查询
+jsonpath-rust = { version = "1.0.4", default-features = false }
+# 剪贴板操作 - 最小功能
+copypasta = { version = "0.10.2", default-features = false }
+# 错误处理
+thiserror = { version = "1.0", default-features = false }
+# 日志记录 - 最小功能
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+# 错误处理
+anyhow = { version = "1.0", default-features = false }
+# 文件对话框
+rfd = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[build-dependencies]
+slint-build = "1.13.0"
+
+[[example]]
+name = "performance_benchmark"
+path = "examples/performance_benchmark.rs"
+
+# 优化配置：大幅减少二进制文件大小
+[profile.release]
+# 优化级别：'z' 为最小体积优化
+opt-level = "z"
+# 启用链接时优化（LTO）
+lto = true
+# 单个代码生成单元，允许更多优化
+codegen-units = 1
+# 遇到panic时直接终止，减少展开代码
+panic = "abort"
+# 去除符号信息（需要Rust 1.59+）
+strip = true
+# 禁用增量编译以获得更好的优化
+incremental = false
+

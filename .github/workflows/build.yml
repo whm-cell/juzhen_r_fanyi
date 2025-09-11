@@ -1,0 +1,432 @@
+name: Multi-Platform Build
+
+on:
+  push:
+    branches: [ main, master, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64 (MSVC)
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x64
+            extension: .exe
+            use_cross: false
+
+          # macOS Intel
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: macos-intel
+            extension: ""
+            use_cross: false
+
+          # macOS Apple Silicon (ARM64)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-arm64
+            extension: ""
+            use_cross: false
+
+          # Linux x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-x64
+            extension: ""
+            use_cross: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+        components: rustfmt, clippy
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
+        cache-on-failure: true
+
+    # Platform-specific dependencies for Slint UI
+    - name: Install Linux dependencies
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          libx11-dev \
+          libxcursor-dev \
+          libxrandr-dev \
+          libxi-dev \
+          libgl1-mesa-dev \
+          libglu1-mesa-dev \
+          libasound2-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev \
+          libx11-xcb-dev \
+          libxcb-render0-dev \
+          libxcb-shape0-dev \
+          libxcb-xfixes0-dev \
+          pkg-config \
+          ninja-build \
+          clang
+
+    - name: Install macOS dependencies
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install ninja
+
+    - name: Install Windows dependencies
+      if: matrix.os == 'windows-latest'
+      run: |
+        # Install ninja via chocolatey
+        choco install ninja
+        # Set CARGO_HOME to avoid path with spaces issues
+        echo "CARGO_HOME=C:\cargo_home" >> $env:GITHUB_ENV
+
+    # Build the project
+    - name: Build project
+      env:
+        # Optimize for Slint/Skia compilation
+        SKIA_NINJA_COMMAND: ninja
+        # Prevent Skia path issues on Windows
+        CARGO_HOME: ${{ matrix.os == 'windows-latest' && 'C:\cargo_home' || '~/.cargo' }}
+      run: |
+        echo "Building for target: ${{ matrix.target }}"
+        echo "Using Rust version:"
+        rustc --version
+        echo "Building with optimized release profile..."
+        cargo build --release --target ${{ matrix.target }} --verbose
+
+    # Create release directory and copy binary
+    - name: Prepare release artifacts
+      shell: bash
+      run: |
+        mkdir -p release
+        binary_path="target/${{ matrix.target }}/release/juzhen_r_fanyi${{ matrix.extension }}"
+        output_name="juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}"
+
+        echo "Copying binary from: $binary_path"
+        echo "To: release/$output_name"
+
+        if [ -f "$binary_path" ]; then
+          cp "$binary_path" "release/$output_name"
+          echo "Binary size: $(du -h "release/$output_name" | cut -f1)"
+        else
+          echo "Error: Binary not found at $binary_path"
+          ls -la target/${{ matrix.target }}/release/
+          exit 1
+        fi
+
+    # Create startup script for each platform
+    - name: Create startup script (Unix)
+      if: matrix.os != 'windows-latest'
+      shell: bash
+      run: |
+        cat > release/start-${{ matrix.name }}.sh << 'EOF'
+        #!/bin/bash
+        # JSON翻译工具启动脚本 v1.0
+        # 智能渲染器选择：GPU -> Skia软件 -> 纯软件
+
+        BINARY_NAME="juzhen_r_fanyi-${{ matrix.name }}"
+
+        echo "🚀 启动JSON翻译工具..."
+        echo "📊 检测系统环境..."
+
+        # 检查二进制文件是否存在
+        if [ ! -f "./$BINARY_NAME" ]; then
+            echo "❌ 错误: 找不到可执行文件 $BINARY_NAME"
+            exit 1
+        fi
+
+        echo "🎮 尝试GPU加速模式..."
+        # 尝试GPU模式
+        ./$BINARY_NAME 2>/dev/null && exit 0
+
+        echo "🖥️  GPU模式失败，尝试Skia软件渲染模式..."
+        # 回退到Skia软件模式
+        SLINT_BACKEND=winit-skia-software ./$BINARY_NAME 2>/dev/null && exit 0
+
+        echo "💻 Skia软件模式失败，使用纯软件渲染模式..."
+        # 最后回退到纯软件模式
+        SLINT_BACKEND=winit-software ./$BINARY_NAME
+        EOF
+        chmod +x release/start-${{ matrix.name }}.sh
+
+    - name: Create startup script (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: bash
+      run: |
+        cat > release/start-${{ matrix.name }}.bat << 'EOF'
+        @echo off
+        REM JSON翻译工具启动脚本 v1.0
+        REM 智能渲染器选择：GPU -> Skia软件 -> 纯软件
+
+        set BINARY_NAME=juzhen_r_fanyi-${{ matrix.name }}.exe
+
+        echo 🚀 启动JSON翻译工具...
+        echo 📊 检测系统环境...
+
+        REM 检查二进制文件是否存在
+        if not exist "%BINARY_NAME%" (
+            echo ❌ 错误: 找不到可执行文件 %BINARY_NAME%
+            pause
+            exit /b 1
+        )
+
+        echo 🎮 尝试GPU加速模式...
+        REM 尝试GPU模式
+        %BINARY_NAME% 2>nul
+        if %errorlevel% equ 0 exit /b 0
+
+        echo 🖥️ GPU模式失败，尝试Skia软件渲染模式...
+        REM 回退到Skia软件模式
+        set SLINT_BACKEND=winit-skia-software
+        %BINARY_NAME% 2>nul
+        if %errorlevel% equ 0 exit /b 0
+
+        echo 💻 Skia软件模式失败，使用纯软件渲染模式...
+        REM 最后回退到纯软件模式
+        set SLINT_BACKEND=winit-software
+        %BINARY_NAME%
+        if %errorlevel% neq 0 (
+            echo ❌ 所有渲染模式都失败了，请检查系统环境
+            pause
+        )
+        EOF
+
+    # Create README for each platform
+    - name: Create platform README
+      shell: bash
+      run: |
+        cat > release/README-${{ matrix.name }}.md << 'EOF'
+        # JSON翻译工具 - ${{ matrix.name }} 版本
+
+        > 基于Rust+Slint的高性能JSON翻译工具，支持大文件处理、影子树索引、JSONPath精确回写
+
+        ## 🚀 快速开始
+
+        ### 方式1：使用启动脚本（推荐）
+        ```bash
+        # Unix系统
+        ./start-${{ matrix.name }}.sh
+
+        # Windows系统
+        start-${{ matrix.name }}.bat
+        ```
+
+        ### 方式2：直接运行
+        ```bash
+        # GPU加速模式（推荐）
+        ./juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}
+
+        # 软件渲染模式（无GPU环境）
+        SLINT_BACKEND=winit-skia-software ./juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}
+
+        # 极简模式（功能受限）
+        SLINT_BACKEND=winit-software ./juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}
+        ```
+
+        ## 💻 系统要求
+
+        - **操作系统**: ${{ matrix.name }}
+        - **内存**: 建议2GB以上
+        - **存储**: 50MB可用空间
+        - **显示**: 支持1024x768以上分辨率
+        - **GPU**: 可选（有GPU时性能更佳）
+
+        ## ✨ 功能特性
+
+        - 🚀 **高性能处理**: 支持大型JSON文件（16K+节点）
+        - 🌳 **智能树视图**: 扁平化显示、字符过滤、空值过滤
+        - 🔍 **强大搜索**: 实时搜索和高级过滤功能
+        - 📝 **精确回写**: JSONPath精确定位和数据回写
+        - 🎨 **现代界面**: 基于Slint UI的现代化界面
+        - 🔧 **多渲染器**: 智能选择最适合的渲染模式
+        - 🌍 **中文支持**: 完整的中文字符显示和处理
+
+        ## 🛠️ 故障排除
+
+        ### 程序无法启动
+        1. 使用启动脚本自动选择合适的渲染器
+        2. 检查系统图形驱动是否正常
+        3. 在终端中运行查看详细错误信息
+
+        ### 性能问题
+        - 优先使用GPU加速模式
+        - 大文件处理时关闭不必要的过滤器
+        - 确保有足够的系统内存
+
+        ### 显示问题
+        - 中文字符不显示：使用Skia渲染器模式
+        - 界面卡顿：尝试软件渲染模式
+        - 阴影效果异常：检查GPU驱动支持
+
+        ## 📚 更多信息
+
+        - 项目主页: https://github.com/your-repo/juzhen_r_fanyi
+        - 技术文档: 查看项目中的 `study.md`
+        - 开发总结: 查看项目中的 `项目完成总结.md`
+
+        ---
+        *构建时间: ${{ github.run_id }} | 版本: ${{ github.sha }}*
+        EOF
+
+    # Copy project documentation
+    - name: Copy project documentation
+      shell: bash
+      run: |
+        # 复制项目文档到发布目录
+        if [ -f "项目完成总结.md" ]; then
+          cp "项目完成总结.md" release/
+        fi
+        if [ -f "study.md" ]; then
+          cp "study.md" release/
+        fi
+        if [ -f "README.md" ]; then
+          cp "README.md" release/
+        fi
+        if [ -f "Cargo.toml" ]; then
+          cp "Cargo.toml" release/
+        fi
+
+    # Upload artifacts
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: juzhen_r_fanyi-${{ matrix.name }}
+        path: release/
+        retention-days: 90
+        if-no-files-found: error
+
+  # Create release when tagged
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create release archives
+      run: |
+        mkdir -p release-archives
+        cd artifacts
+
+        echo "📦 创建发布包..."
+        for dir in */; do
+          platform=${dir%/}
+          echo "处理平台: $platform"
+          cd "$dir"
+
+          # 显示文件列表
+          echo "包含文件:"
+          ls -la
+
+          # 创建压缩包
+          if [[ "$platform" == *"windows"* ]]; then
+            zip -r "../../release-archives/${platform}.zip" .
+            echo "✅ 创建 ${platform}.zip"
+          else
+            tar -czf "../../release-archives/${platform}.tar.gz" .
+            echo "✅ 创建 ${platform}.tar.gz"
+          fi
+          cd ..
+        done
+
+        echo "📊 发布包大小:"
+        cd ../release-archives
+        ls -lh
+
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        cat > release_notes.md << 'EOF'
+        ## 🎉 JSON翻译工具 ${{ github.ref_name }}
+
+        > 基于Rust+Slint的高性能JSON翻译工具，支持大文件处理、影子树索引、JSONPath精确回写
+
+        ### 🚀 支持平台
+        - **Windows x64** - 支持Windows 10/11
+        - **macOS Intel** - 支持macOS 10.15+
+        - **macOS Apple Silicon (ARM64)** - 支持M1/M2/M3芯片
+        - **Linux x64** - 支持主流Linux发行版
+
+        ### 📦 使用方法
+        1. **下载**: 选择对应平台的压缩包下载
+        2. **解压**: 解压到任意目录
+        3. **运行**: 使用启动脚本或直接运行可执行文件
+
+        ### ✨ 核心特性
+        - 🚀 **高性能处理**: 支持大型JSON文件（16K+节点，13ms加载）
+        - 🌳 **智能树视图**: 扁平化显示、字符过滤、空值过滤
+        - 🔍 **强大搜索**: 实时搜索和高级过滤功能
+        - 📝 **精确回写**: JSONPath精确定位和数据回写
+        - 🎨 **现代界面**: 基于Slint UI的现代化界面
+        - 🔧 **多渲染器**: GPU/软件/极简三种渲染模式
+        - 🌍 **中文支持**: 完整的中文字符显示和处理
+
+        ### 🛠️ 技术亮点
+        - **MVVM架构**: 清晰的职责分离
+        - **影子树索引**: O(1)时间复杂度的节点查找
+        - **智能渲染器选择**: 根据环境自动适配最佳渲染模式
+        - **线程安全设计**: 使用Rc<RefCell<T>>确保UI线程安全
+        - **内存优化**: 高度优化的内存使用和性能
+
+        ### 📚 文档说明
+        每个平台包都包含：
+        - **README-{platform}.md**: 平台特定的使用说明
+        - **start-{platform}**: 智能启动脚本
+        - **项目完成总结.md**: 完整的开发总结
+        - **study.md**: 详细的技术教程和AI阅读指南
+
+        ### 🔧 故障排除
+        如果遇到问题，请：
+        1. 优先使用启动脚本（自动选择最佳渲染器）
+        2. 检查系统图形驱动是否正常
+        3. 查看平台特定的README文件
+        4. 在终端中运行查看详细错误信息
+
+        ---
+        **构建信息**: GitHub Actions自动构建 | **构建ID**: ${{ github.run_id }}
+        EOF
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: release-archives/*
+        draft: false
+        prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}
+        generate_release_notes: false
+        body_path: release_notes.md
+        tag_name: ${{ github.ref_name }}
+        name: "JSON翻译工具 ${{ github.ref_name }}"
+        token: ${{ secrets.GITHUB_TOKEN }}
