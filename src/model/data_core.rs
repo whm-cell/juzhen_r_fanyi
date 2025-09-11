@@ -218,7 +218,7 @@ impl AppState {
     }
 
     /// 构建“中间产物 第二阶段”：按过滤条件枚举命中项，派生并提取同层级的 name 字段值，生成带连续序号的清单
-    pub fn build_intermediate_stage2<F>(&self, filter: &str, mut progress_callback: F) -> Result<String, AppError>
+    pub fn build_intermediate_stage2<F>(&self, filter: &str, progress_callback: F) -> Result<String, AppError>
     where
         F: FnMut(f32, &str),
     {
@@ -281,7 +281,7 @@ impl AppState {
                     _ => {}
                 }
             }
-            if let Some(idx) = last_dot { Some(format!("{}{}", &src[..idx], ".name")) } else { None }
+            last_dot.map(|idx| format!("{}{}", &src[..idx], ".name"))
         }
 
         // 批量收集所有需要查询的路径，减少重复查询
@@ -409,7 +409,7 @@ impl AppState {
             .map_err(|e| AppError::JsonPath(e.to_string()))?;
 
         std::fs::write(path, json_str)
-            .map_err(|e| AppError::Io(e))?;
+            .map_err(AppError::Io)?;
 
         tracing::info!("JSON文件已保存到: {}", path.display());
         Ok(())
@@ -460,7 +460,7 @@ impl AppState {
         let mut english_fields = HashSet::new();
 
         // 递归遍历JSON值，提取英文属性名
-        self.extract_english_keys(dom, &mut english_fields, leaf_nodes_only);
+        Self::extract_english_keys(dom, &mut english_fields, leaf_nodes_only);
 
         // 转换为排序的向量，过滤掉不符合条件的字段
         let mut result: Vec<String> = english_fields
@@ -522,7 +522,7 @@ impl AppState {
         let len = s.len();
 
         // 快速长度检查
-        if len < 8 || len > 30 {
+        if !(8..=30).contains(&len) {
             return false;
         }
 
@@ -539,7 +539,7 @@ impl AppState {
         }
 
         // 日期格式: 2023-01-01
-        if s.matches('-').count() == 2 && len >= 8 && len <= 12 {
+        if s.matches('-').count() == 2 && (8..=12).contains(&len) {
             let parts: Vec<&str> = s.split('-').collect();
             if parts.len() == 3 &&
                parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit()) &&
@@ -550,7 +550,7 @@ impl AppState {
         }
 
         // 时间格式: 12:34:56
-        if s.matches(':').count() == 2 && len >= 6 && len <= 10 {
+        if s.matches(':').count() == 2 && (6..=10).contains(&len) {
             let parts: Vec<&str> = s.split(':').collect();
             if parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
                 return true;
@@ -565,7 +565,7 @@ impl AppState {
         let len = s.len();
 
         // 快速长度检查
-        if len < 3 || len > 20 {
+        if !(3..=20).contains(&len) {
             return false;
         }
 
@@ -583,7 +583,7 @@ impl AppState {
 
         // 检查点号数量（1-3个点号是合理的版本号）
         let dot_count = version_str.matches('.').count();
-        if dot_count < 1 || dot_count > 3 {
+        if !(1..=3).contains(&dot_count) {
             return false;
         }
 
@@ -602,7 +602,7 @@ impl AppState {
         let len = s.len();
 
         // 快速长度检查
-        if len < 7 || len > 2000 {  // 最短的URL如 http://a 至少7个字符
+        if !(7..=2000).contains(&len) {  // 最短的URL如 http://a 至少7个字符
             return false;
         }
 
@@ -642,7 +642,6 @@ impl AppState {
     /// 递归提取JSON中的英文属性名（键名），只收集值为字符串且值不是时间格式的属性名
     /// 对于URL类型的属性值，直接提取URL本身而不是属性名
     fn extract_english_keys(
-        &self,
         value: &Value,
         english_fields: &mut HashSet<String>,
         leaf_nodes_only: bool,
@@ -650,7 +649,7 @@ impl AppState {
         match value {
             Value::Array(arr) => {
                 for item in arr {
-                    self.extract_english_keys(item, english_fields, leaf_nodes_only);
+                    Self::extract_english_keys(item, english_fields, leaf_nodes_only);
                 }
             }
             Value::Object(obj) => {
@@ -680,7 +679,7 @@ impl AppState {
                     }
 
                     // 递归检查子结构的键名（无论值是什么类型）
-                    self.extract_english_keys(val, english_fields, leaf_nodes_only);
+                    Self::extract_english_keys(val, english_fields, leaf_nodes_only);
                 }
             }
             _ => {} // 忽略其他类型（数字、布尔值、null、字符串值）

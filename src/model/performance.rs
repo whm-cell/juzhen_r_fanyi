@@ -196,9 +196,11 @@ pub fn run_performance_suite() -> Vec<PerformanceResult> {
         
         // AppState加载测试（使用内存数据）
         let start = Instant::now();
-        let mut app_state = AppState::default();
-        app_state.dom = Some(json_data.clone());
-        app_state.tree_flat = build_shadow_tree(&json_data);
+        let app_state = AppState {
+            dom: Some(json_data.clone()),
+            tree_flat: build_shadow_tree(&json_data),
+            ..Default::default()
+        };
         let load_time = start.elapsed();
         
         results.push(PerformanceResult::new(
