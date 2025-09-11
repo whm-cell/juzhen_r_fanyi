@@ -86,6 +86,11 @@ export component AppWindow inherits Window {
     in-out property<string> message_dialog_title: "";        // 消息对话框标题
     in-out property<string> message_dialog_text: "";         // 消息对话框内容
 
+    // === JSON结构树控制属性 ===
+    in-out property<bool> tree_flatten_mode: false;          // 是否扁平化显示
+    in-out property<string> tree_char_filter: "all";         // 字符过滤模式: "all", "chinese", "english"
+    in-out property<bool> tree_hide_empty: false;            // 是否隐藏空值
+
     // === 回调函数 ===
     callback load_file();                                    // 加载文件
     callback node_selected(string);                         // 节点被选中
@@ -106,6 +111,9 @@ export component AppWindow inherits Window {
     callback show_message_dialog(string, string);            // 显示消息对话框(标题, 内容)
     callback close_message_dialog();                         // 关闭消息对话框
     callback reload_file_after_writeback(string);            // 回写后重新加载文件
+    callback toggle_tree_flatten();                          // 切换扁平化显示
+    callback set_tree_char_filter(string);                   // 设置字符过滤模式
+    callback toggle_tree_hide_empty();                       // 切换隐藏空值
 
     // === 进度条控制函数 ===
     public function show_progress(text: string) {
@@ -295,12 +303,55 @@ export component AppWindow inherits Window {
                     padding: content_padding;
                     spacing: panel_spacing;
 
-                    Text {
-                        text: "JSON 结构树";
-                        font-size: 16px;
-                        font-family: terminal_font;
-                        font-weight: 600;
-                        color: accent_color;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: space-between;
+
+                        Text {
+                            text: "JSON 结构树";
+                            font-size: 16px;
+                            font-family: terminal_font;
+                            font-weight: 600;
+                            color: accent_color;
+                            vertical-alignment: center;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 4px;
+                            alignment: end;
+
+                            // 扁平化按钮
+                            TerminalButton {
+                                text: tree_flatten_mode ? "层级" : "扁平";
+                                width: 50px;
+                                height: 24px;
+                                clicked => { toggle_tree_flatten(); }
+                            }
+
+                            // 字符过滤按钮
+                            TerminalButton {
+                                text: tree_char_filter == "chinese" ? "中文" : (tree_char_filter == "english" ? "英文" : "全部");
+                                width: 50px;
+                                height: 24px;
+                                clicked => {
+                                    if (tree_char_filter == "all") {
+                                        set_tree_char_filter("chinese");
+                                    } else if (tree_char_filter == "chinese") {
+                                        set_tree_char_filter("english");
+                                    } else {
+                                        set_tree_char_filter("all");
+                                    }
+                                }
+                            }
+
+                            // 隐藏空值按钮
+                            TerminalButton {
+                                text: tree_hide_empty ? "显空" : "隐空";
+                                width: 50px;
+                                height: 24px;
+                                clicked => { toggle_tree_hide_empty(); }
+                            }
+                        }
                     }
 
                     Rectangle {

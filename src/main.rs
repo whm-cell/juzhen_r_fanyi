@@ -252,6 +252,35 @@ impl ViewModelBridge {
             });
         }
 
+        // === JSON结构树控制回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_toggle_tree_flatten(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_toggle_tree_flatten(&app_window, &app_state);
+                }
+            });
+        }
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_set_tree_char_filter(move |filter| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_set_tree_char_filter(&app_window, &app_state, &filter.to_string());
+                }
+            });
+        }
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_toggle_tree_hide_empty(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_toggle_tree_hide_empty(&app_window, &app_state);
+                }
+            });
+        }
+
         // === 节点展开/折叠回调 ===
         {
             let app_state = app_state.clone();
@@ -351,6 +380,11 @@ impl ViewModelBridge {
                 app_window.set_current_path(path_str.into());
                 let model = ModelRc::new(VecModel::from(tree_data));
                 app_window.set_tree_model(model);
+
+                // 初始化树控制状态
+                app_window.set_tree_flatten_mode(false);
+                app_window.set_tree_char_filter("all".into());
+                app_window.set_tree_hide_empty(false);
 
                 // 显示性能信息
                 let perf_info = format!("加载: {:.2}ms | 节点: {} | 内存: ~{:.1}MB",
@@ -666,18 +700,8 @@ impl ViewModelBridge {
         // 应用搜索过滤
         app_state.borrow_mut().apply_search_filter(filter);
 
-        // 更新树视图 - 只包含可见的节点
-        let tree_data: Vec<TreeNodeData> = app_state.borrow().tree_flat
-            .iter()
-            .filter(|node| node.visible)
-            .map(TreeNodeData::from)
-            .collect();
-
-        let tree_model = ModelRc::new(VecModel::from(tree_data));
-
-
-
-        app_window.set_tree_model(tree_model);
+        // 使用新的重建函数，支持扁平化和字符过滤
+        Self::rebuild_tree_model(app_window, app_state);
 
         // 搜索模式：仅构建“匹配列表”模型，不在预览区一次性渲染聚合内容
         if filter.trim().is_empty() {
@@ -723,15 +747,8 @@ impl ViewModelBridge {
         // 切换节点展开状态
         app_state.borrow_mut().toggle_node_expanded(node_path);
 
-        // 更新树视图 - 只包含可见的节点
-        let tree_data: Vec<TreeNodeData> = app_state.borrow().tree_flat
-            .iter()
-            .filter(|node| node.visible)
-            .map(TreeNodeData::from)
-            .collect();
-
-        let tree_model = ModelRc::new(VecModel::from(tree_data));
-        app_window.set_tree_model(tree_model);
+        // 使用新的重建函数，支持扁平化和字符过滤
+        Self::rebuild_tree_model(app_window, app_state);
 
         let toggle_duration = start_time.elapsed();
 
@@ -1399,21 +1416,145 @@ impl ViewModelBridge {
         }
 
         // 在借用结束后，重新获取数据更新UI
-        let tree_data: Vec<TreeNodeData> = {
-            let state = app_state.borrow();
-            state.tree_flat
-                .iter()
-                .filter(|node| node.visible)
-                .map(TreeNodeData::from)
-                .collect()
-        };
-
-        let model = ModelRc::new(VecModel::from(tree_data));
-        app_window.set_tree_model(model);
+        Self::rebuild_tree_model(app_window, app_state);
         app_window.set_current_path(file_path.into());
 
         Self::append_writeback_log(app_window, "✅ JSON结构树已更新");
         app_window.set_status_message("JSON结构树更新完成".into());
+    }
+
+    /// 处理扁平化显示切换
+    fn handle_toggle_tree_flatten(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        let current_mode = app_window.get_tree_flatten_mode();
+        app_window.set_tree_flatten_mode(!current_mode);
+
+        // 重新构建树模型
+        Self::rebuild_tree_model(app_window, app_state);
+
+        let mode_text = if !current_mode { "扁平化" } else { "层级" };
+        app_window.set_status_message(format!("已切换到{}显示模式", mode_text).into());
+    }
+
+    /// 处理字符过滤设置
+    fn handle_set_tree_char_filter(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, filter: &str) {
+        app_window.set_tree_char_filter(filter.into());
+
+        // 重新构建树模型
+        Self::rebuild_tree_model(app_window, app_state);
+
+        let filter_text = match filter {
+            "chinese" => "中文字符",
+            "english" => "英文字符",
+            _ => "全部字符"
+        };
+        app_window.set_status_message(format!("已设置过滤显示: {}", filter_text).into());
+    }
+
+    /// 重新构建树模型（应用扁平化、字符过滤和空值过滤）
+    fn rebuild_tree_model(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        let flatten_mode = app_window.get_tree_flatten_mode();
+        let char_filter = app_window.get_tree_char_filter().to_string();
+        let hide_empty = app_window.get_tree_hide_empty();
+
+        let tree_data: Vec<TreeNodeData> = {
+            let state = app_state.borrow();
+            let mut nodes: Vec<TreeNodeData> = state.tree_flat
+                .iter()
+                .filter(|node| node.visible)
+                .map(TreeNodeData::from)
+                .collect();
+
+            // 应用字符过滤
+            if char_filter != "all" {
+                nodes.retain(|node| Self::matches_char_filter(&node.preview.to_string(), &char_filter));
+            }
+
+            // 应用空值过滤
+            if hide_empty {
+                nodes.retain(|node| !Self::is_empty_value(&node.preview.to_string(), &node.kind.to_string()));
+            }
+
+            // 应用扁平化
+            if flatten_mode {
+                // 扁平化：移除层级缩进，所有节点深度设为0
+                for node in &mut nodes {
+                    node.depth = 0;
+                }
+            }
+
+            nodes
+        };
+
+        let model = ModelRc::new(VecModel::from(tree_data));
+        app_window.set_tree_model(model);
+    }
+
+    /// 检查文本是否匹配字符过滤条件
+    fn matches_char_filter(text: &str, filter: &str) -> bool {
+        match filter {
+            "chinese" => {
+                // 纯中文：包含中文字符且不包含英文字符
+                let has_chinese = text.chars().any(|c| Self::is_chinese_char(c));
+                let has_english = text.chars().any(|c| Self::is_english_char(c));
+                has_chinese && !has_english
+            },
+            "english" => {
+                // 纯英文：包含英文字符且不包含中文字符
+                let has_chinese = text.chars().any(|c| Self::is_chinese_char(c));
+                let has_english = text.chars().any(|c| Self::is_english_char(c));
+                has_english && !has_chinese
+            },
+            _ => true
+        }
+    }
+
+    /// 判断是否为中文字符
+    fn is_chinese_char(c: char) -> bool {
+        let code = c as u32;
+        // CJK统一汉字基本区块: U+4E00-U+9FFF
+        // CJK统一汉字扩展A区: U+3400-U+4DBF
+        // CJK兼容汉字: U+F900-U+FAFF
+        (code >= 0x4E00 && code <= 0x9FFF) ||
+        (code >= 0x3400 && code <= 0x4DBF) ||
+        (code >= 0xF900 && code <= 0xFAFF)
+    }
+
+    /// 判断是否为英文字符
+    fn is_english_char(c: char) -> bool {
+        c.is_ascii_alphabetic()
+    }
+
+    /// 处理隐藏空值切换
+    fn handle_toggle_tree_hide_empty(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        let current_mode = app_window.get_tree_hide_empty();
+        app_window.set_tree_hide_empty(!current_mode);
+
+        // 重新构建树模型
+        Self::rebuild_tree_model(app_window, app_state);
+
+        let mode_text = if !current_mode { "隐藏空值" } else { "显示空值" };
+        app_window.set_status_message(format!("已切换到{}模式", mode_text).into());
+    }
+
+    /// 判断是否为空值
+    fn is_empty_value(preview: &str, kind: &str) -> bool {
+        match kind {
+            "Null" => true,
+            "String" => {
+                // 去除引号后检查是否为空字符串
+                let trimmed = preview.trim_matches('"').trim();
+                trimmed.is_empty()
+            },
+            "Array" => {
+                // 空数组显示为 "[]"
+                preview.trim() == "[]"
+            },
+            "Object" => {
+                // 空对象显示为 "{}"
+                preview.trim() == "{}"
+            },
+            _ => false
+        }
     }
 }
 
