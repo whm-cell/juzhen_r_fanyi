@@ -86,6 +86,11 @@ jobs:
           libxcb-render0-dev \
           libxcb-shape0-dev \
           libxcb-xfixes0-dev \
+          libgtk-3-dev \
+          libglib2.0-dev \
+          libgdk-pixbuf2.0-dev \
+          libatk1.0-dev \
+          libcairo-gobject2 \
           pkg-config \
           ninja-build \
           clang
