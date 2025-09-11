@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use std::collections::HashSet;
 
-use crate::model::shadow_tree::build_shadow_tree;
+use crate::model::shadow_tree::{build_shadow_tree, NodeKind};
 use crate::utils::fs::{read_json_file, write_json_file};
 
 #[derive(Debug, Default)]
@@ -222,6 +222,14 @@ impl AppState {
     where
         F: FnMut(f32, &str),
     {
+        self.build_intermediate_stage2_with_leaf_filter(filter, false, progress_callback)
+    }
+
+    /// 构建"中间产物 第二阶段"：支持叶子节点过滤的版本
+    pub fn build_intermediate_stage2_with_leaf_filter<F>(&self, filter: &str, leaf_nodes_only: bool, mut progress_callback: F) -> Result<String, AppError>
+    where
+        F: FnMut(f32, &str),
+    {
         if filter.trim().is_empty() {
             return Ok("".to_string());
         }
@@ -240,7 +248,16 @@ impl AppState {
         let match_start = std::time::Instant::now();
         let mut matched: Vec<&crate::model::shadow_tree::JsonTreeNode> = Vec::new();
         for node in &self.tree_flat {
-            if node.visible && (node.path.contains(filter) || node.name.contains(filter)) {
+            // 应用叶子节点过滤逻辑
+            let should_include = if leaf_nodes_only {
+                // 叶子节点模式：只匹配属性名包含过滤条件的真正叶子节点（具有简单值的节点）
+                node.visible && node.name.contains(filter) && matches!(node.kind, NodeKind::String | NodeKind::Number | NodeKind::Bool | NodeKind::Null)
+            } else {
+                // 全部节点模式：匹配路径或属性名包含过滤条件的节点
+                node.visible && (node.path.contains(filter) || node.name.contains(filter))
+            };
+
+            if should_include {
                 matched.push(node);
             }
         }
@@ -434,7 +451,7 @@ impl AppState {
     }
 
     /// 智能检测JSON中的英文字段，返回纯英文的字段值列表
-    pub fn detect_english_fields(&self) -> Result<Vec<String>, AppError> {
+    pub fn detect_english_fields(&self, leaf_nodes_only: bool) -> Result<Vec<String>, AppError> {
         let dom = self
             .dom
             .as_ref()
@@ -443,7 +460,7 @@ impl AppState {
         let mut english_fields = HashSet::new();
 
         // 递归遍历JSON值，提取英文属性名
-        self.extract_english_keys(dom, &mut english_fields);
+        self.extract_english_keys(dom, &mut english_fields, leaf_nodes_only);
 
         // 转换为排序的向量，过滤掉不符合条件的字段
         let mut result: Vec<String> = english_fields
@@ -612,42 +629,58 @@ impl AppState {
         false
     }
 
+    /// 判断是否为叶子节点（具有具体值的节点）
+    fn is_leaf_node(value: &Value) -> bool {
+        matches!(value,
+            Value::String(_) |
+            Value::Number(_) |
+            Value::Bool(_) |
+            Value::Null
+        )
+    }
+
     /// 递归提取JSON中的英文属性名（键名），只收集值为字符串且值不是时间格式的属性名
     /// 对于URL类型的属性值，直接提取URL本身而不是属性名
     fn extract_english_keys(
         &self,
         value: &Value,
         english_fields: &mut HashSet<String>,
+        leaf_nodes_only: bool,
     ) {
         match value {
             Value::Array(arr) => {
                 for item in arr {
-                    self.extract_english_keys(item, english_fields);
+                    self.extract_english_keys(item, english_fields, leaf_nodes_only);
                 }
             }
             Value::Object(obj) => {
                 for (key, val) in obj {
-                    // 只有当属性值是字符串且不是时间格式时，才收集键名或URL
-                    if let Value::String(string_value) = val {
-                        let trimmed_key = key.trim();
-                        let trimmed_value = string_value.trim();
+                    // 叶子节点过滤：如果开启了叶子节点模式，只处理叶子节点
+                    let is_leaf = Self::is_leaf_node(val);
 
-                        // 检查属性值是否为时间格式或版本号格式
-                        if !trimmed_key.is_empty() &&
-                           !Self::is_time_format(trimmed_value) &&
-                           !Self::is_version_format(trimmed_value) {
-                            // 如果属性值是URL，直接提取URL本身
-                            if Self::is_url_format(trimmed_value) {
-                                english_fields.insert(trimmed_value.to_string());
-                            } else {
-                                // 否则提取属性名
-                                english_fields.insert(trimmed_key.to_string());
+                    if !leaf_nodes_only || is_leaf {
+                        // 只有当属性值是字符串且不是时间格式时，才收集键名或URL
+                        if let Value::String(string_value) = val {
+                            let trimmed_key = key.trim();
+                            let trimmed_value = string_value.trim();
+
+                            // 检查属性值是否为时间格式或版本号格式
+                            if !trimmed_key.is_empty() &&
+                               !Self::is_time_format(trimmed_value) &&
+                               !Self::is_version_format(trimmed_value) {
+                                // 如果属性值是URL，直接提取URL本身
+                                if Self::is_url_format(trimmed_value) {
+                                    english_fields.insert(trimmed_value.to_string());
+                                } else {
+                                    // 否则提取属性名
+                                    english_fields.insert(trimmed_key.to_string());
+                                }
                             }
                         }
                     }
 
                     // 递归检查子结构的键名（无论值是什么类型）
-                    self.extract_english_keys(val, english_fields);
+                    self.extract_english_keys(val, english_fields, leaf_nodes_only);
                 }
             }
             _ => {} // 忽略其他类型（数字、布尔值、null、字符串值）

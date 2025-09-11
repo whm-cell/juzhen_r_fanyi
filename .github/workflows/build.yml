@@ -286,10 +286,9 @@ jobs:
       run: |
         cat > release_notes.md << 'EOF'
         
-        优化自动化构建流程
-
-        ---
-        **构建信息**: GitHub Actions自动构建 | **构建ID**: ${{ github.run_id }}
+        1. 修复复杂节点出现的BUG
+        2. 优化首页样式
+        
         EOF
 
     - name: Create GitHub Release

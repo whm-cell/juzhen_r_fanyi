@@ -8,3 +8,5 @@ docs
 xqwn
 1
 scripts*
+*.sh
+src/bin*

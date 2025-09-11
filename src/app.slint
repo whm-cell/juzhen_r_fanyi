@@ -93,6 +93,7 @@ export component AppWindow inherits Window {
 
     // === 智能英文字段检测属性 ===
     in property<[string]> english_fields: [];                // 检测到的英文字段列表
+    in-out property<bool> leaf_nodes_only: false;            // 是否只显示叶子节点
 
     // === 回调函数 ===
     callback load_file();                                    // 加载文件
@@ -118,6 +119,7 @@ export component AppWindow inherits Window {
     callback set_tree_char_filter(string);                   // 设置字符过滤模式
     callback toggle_tree_hide_empty();                       // 切换隐藏空值
     callback detect_english_fields();                        // 检测英文字段
+    callback toggle_leaf_nodes_only();                       // 切换叶子节点过滤模式
     callback apply_search_filter(string);                    // 应用搜索过滤
     callback extract_search_results(string);                 // 提取搜索结果
 
@@ -245,16 +247,22 @@ export component AppWindow inherits Window {
                     }
 
                     Rectangle {
-                        width: 200px;
-                        height: 28px;
+                        width: 220px;
+                        height: 32px;
                         background: background_primary;
                         border-width: 1px;
                         border-color: search_filter == "" ? border_color : accent_color;
-                        border-radius: 2px;
+                        border-radius: 4px;
+                        drop-shadow-blur: search_filter == "" ? 0px : 2px;
+                        drop-shadow-color: search_filter == "" ? transparent : #39FF1440;
 
                         TextInput {
+                            x: 8px;
+                            y: 6px;
+                            width: parent.width - 16px;
+                            height: parent.height - 12px;
                             text <=> search_filter;
-                            font-size: 12px;
+                            font-size: 13px;
                             font-family: terminal_font;
                             color: text_primary;
                             edited => { search_changed(self.text); }
@@ -285,6 +293,14 @@ export component AppWindow inherits Window {
 
                             clear_touch_area := TouchArea {}
                         }
+                    }
+
+                    // 叶子节点过滤开关
+                    TerminalButton {
+                        text: leaf_nodes_only ? "叶子节点" : "全部节点";
+                        width: 80px;
+                        height: 28px;
+                        clicked => { toggle_leaf_nodes_only(); }
                     }
 
                     // 智能英文字段检测区域 - 父级滚动容器

@@ -2,7 +2,7 @@
 
 use std::{cell::RefCell, rc::Rc, path::PathBuf};
 use tracing_subscriber::fmt::SubscriberBuilder;
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel, Model};
 use serde_json::Value;
 
 slint::include_modules!();
@@ -277,6 +277,15 @@ impl ViewModelBridge {
             app_window.on_toggle_tree_hide_empty(move || {
                 if let Some(app_window) = app_window_weak.upgrade() {
                     Self::handle_toggle_tree_hide_empty(&app_window, &app_state);
+                }
+            });
+        }
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_toggle_leaf_nodes_only(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_toggle_leaf_nodes_only(&app_window, &app_state);
                 }
             });
         }
@@ -565,8 +574,28 @@ impl ViewModelBridge {
         final_full_text: &Rc<RefCell<String>>
     ) {
         let filter = app_window.get_search_filter().to_string();
-        if filter.trim().is_empty() {
-            app_window.set_status_message("错误: 过滤条件为空，请先设置搜索条件".into());
+        let leaf_nodes_only = app_window.get_leaf_nodes_only();
+
+        // 如果开启了叶子节点模式且搜索框为空，自动使用检测到的英文字段
+        let effective_filter = if leaf_nodes_only && filter.trim().is_empty() {
+            // 获取检测到的英文字段，使用第一个作为过滤条件
+            let english_fields = app_window.get_english_fields();
+            if english_fields.row_count() > 0 {
+                english_fields.row_data(0).unwrap_or_default().to_string()
+            } else {
+                filter.clone()
+            }
+        } else {
+            filter.clone()
+        };
+
+        if effective_filter.trim().is_empty() {
+            let error_msg = if leaf_nodes_only {
+                "错误: 叶子节点模式下未检测到英文字段，请先加载包含英文字段的JSON文件"
+            } else {
+                "错误: 过滤条件为空，请先设置搜索条件"
+            };
+            app_window.set_status_message(error_msg.into());
             return;
         }
 
@@ -578,7 +607,7 @@ impl ViewModelBridge {
         let app_state_clone = app_state.clone();
         let preview_full_text_clone = preview_full_text.clone();
         let final_full_text_clone = final_full_text.clone();
-        let filter_clone = filter.clone();
+        let filter_clone = effective_filter.clone();
 
         slint::spawn_local(async move {
             tracing::info!("一键获得最终产物：开始执行");
@@ -595,7 +624,13 @@ impl ViewModelBridge {
                 }
             };
 
-            match app_state_clone.borrow().build_intermediate_stage2(&filter_clone, progress_callback) {
+            let leaf_nodes_only = if let Some(app) = app_weak.upgrade() {
+                app.get_leaf_nodes_only()
+            } else {
+                false
+            };
+
+            match app_state_clone.borrow().build_intermediate_stage2_with_leaf_filter(&filter_clone, leaf_nodes_only, progress_callback) {
                 Ok(stage2_json) => {
                     tracing::info!("一键获得最终产物：中间产物2生成成功");
 
@@ -865,7 +900,13 @@ impl ViewModelBridge {
                 }
             };
 
-            match app_state_clone.borrow().build_intermediate_stage2(&filter_clone, progress_callback) {
+            let leaf_nodes_only = if let Some(app) = app_weak.upgrade() {
+                app.get_leaf_nodes_only()
+            } else {
+                false
+            };
+
+            match app_state_clone.borrow().build_intermediate_stage2_with_leaf_filter(&filter_clone, leaf_nodes_only, progress_callback) {
                 Ok(stage2_json) => {
                     let build_time = build_start.elapsed().as_millis();
                     tracing::info!("build_intermediate_stage2 执行成功，总耗时: {}ms，开始处理结果", build_time);
@@ -1572,6 +1613,18 @@ impl ViewModelBridge {
         app_window.set_status_message(format!("已切换到{}模式", mode_text).into());
     }
 
+    /// 处理叶子节点过滤切换
+    fn handle_toggle_leaf_nodes_only(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
+        let current_mode = app_window.get_leaf_nodes_only();
+        app_window.set_leaf_nodes_only(!current_mode);
+
+        // 重新检测英文字段
+        Self::handle_detect_english_fields(app_window, app_state);
+
+        let mode_text = if !current_mode { "叶子节点" } else { "全部节点" };
+        app_window.set_status_message(format!("已切换到{}模式", mode_text).into());
+    }
+
     /// 判断是否为空值
     fn is_empty_value(preview: &str, kind: &str) -> bool {
         match kind {
@@ -1595,7 +1648,8 @@ impl ViewModelBridge {
 
     /// 处理智能英文字段检测
     fn handle_detect_english_fields(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
-        match app_state.borrow().detect_english_fields() {
+        let leaf_nodes_only = app_window.get_leaf_nodes_only();
+        match app_state.borrow().detect_english_fields(leaf_nodes_only) {
             Ok(english_fields) => {
                 // 转换为Slint可用的字符串数组
                 let slint_fields: Vec<slint::SharedString> = english_fields
