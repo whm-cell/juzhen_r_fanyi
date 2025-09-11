@@ -103,16 +103,7 @@ impl ViewModelBridge {
             });
         }
 
-        // === 回写按钮回调 ===
-        {
-            let app_state = app_state.clone();
-            let app_window_weak = app_window.as_weak();
-            app_window.on_write_back_pressed(move || {
-                if let Some(app_window) = app_window_weak.upgrade() {
-                    Self::handle_write_back_pressed(&app_window, &app_state);
-                }
-            });
-        }
+
 
         // === 一键获得最终产物回调 ===
         {
@@ -210,21 +201,14 @@ impl ViewModelBridge {
             let app_state = app_state.clone();
             let app_window_weak = app_window.as_weak();
             let preview_full_text = self.preview_full_text.clone();
+            let final_full_text = self.final_full_text.clone();
             app_window.on_upload_writeback_file(move || {
                 if let Some(app_window) = app_window_weak.upgrade() {
-                    Self::handle_upload_writeback_file(&app_window, &app_state, &preview_full_text);
+                    Self::handle_upload_writeback_file(&app_window, &app_state, &preview_full_text, &final_full_text);
                 }
             });
         }
-        {
-            let app_state = app_state.clone();
-            let app_window_weak = app_window.as_weak();
-            app_window.on_save_modified_json(move || {
-                if let Some(app_window) = app_window_weak.upgrade() {
-                    Self::handle_save_modified_json(&app_window, &app_state);
-                }
-            });
-        }
+
 
         // === 清空回写日志回调 ===
         {
@@ -232,6 +216,38 @@ impl ViewModelBridge {
             app_window.on_clear_writeback_log(move || {
                 if let Some(app_window) = app_window_weak.upgrade() {
                     app_window.set_writeback_log("".into());
+                }
+            });
+        }
+
+        // === 消息对话框回调 ===
+        {
+            let app_window_weak = app_window.as_weak();
+            app_window.on_show_message_dialog(move |title, text| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    app_window.set_message_dialog_title(title);
+                    app_window.set_message_dialog_text(text);
+                    app_window.set_message_dialog_visible(true);
+                }
+            });
+        }
+
+        {
+            let app_window_weak = app_window.as_weak();
+            app_window.on_close_message_dialog(move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    app_window.set_message_dialog_visible(false);
+                }
+            });
+        }
+
+        // === 回写后重新加载文件回调 ===
+        {
+            let app_state = app_state.clone();
+            let app_window_weak = app_window.as_weak();
+            app_window.on_reload_file_after_writeback(move |file_path| {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    Self::handle_reload_file_after_writeback(&app_window, &app_state, &file_path.to_string());
                 }
             });
         }
@@ -253,7 +269,7 @@ impl ViewModelBridge {
         app_window.set_status_message(STATUS_READY.into());
         app_window.set_current_path("".into());
         app_window.set_preview_text("".into());
-        app_window.set_paste_text("".into());
+
         app_window.set_selected_json_path("".into());
         app_window.set_writeback_log("".into());
 
@@ -469,92 +485,7 @@ impl ViewModelBridge {
         tracing::info!("回写日志: {}", message);
     }
 
-    /// 处理回写按钮操作
-    fn handle_write_back_pressed(
-        app_window: &AppWindow,
-        app_state: &Rc<RefCell<AppState>>
-    ) {
-        let paste_text = app_window.get_paste_text().to_string();
-        let selected_path = app_window.get_selected_json_path().to_string();
 
-        Self::append_writeback_log(app_window, "开始回写操作...");
-
-        if paste_text.trim().is_empty() {
-            Self::append_writeback_log(app_window, "❌ 错误: 粘贴区域为空");
-            app_window.set_status_message("错误: 粘贴区域为空".into());
-            return;
-        }
-
-        if selected_path.is_empty() {
-            Self::append_writeback_log(app_window, "❌ 错误: 未选择节点");
-            app_window.set_status_message("错误: 未选择节点".into());
-            return;
-        }
-
-        Self::append_writeback_log(app_window, &format!("📍 目标路径: {}", selected_path));
-        Self::append_writeback_log(app_window, &format!("📝 数据长度: {} 字符", paste_text.len()));
-
-        // 开始性能监控
-        let start_time = Instant::now();
-
-        Self::append_writeback_log(app_window, "🔄 正在执行JSON更新...");
-        let update_result = app_state.borrow_mut().update_node_from_str(&selected_path, &paste_text);
-        match update_result {
-            Ok(()) => {
-                let update_duration = start_time.elapsed();
-                Self::append_writeback_log(app_window, &format!("✅ JSON更新成功 (耗时: {:.1}ms)", update_duration.as_millis()));
-
-                Self::append_writeback_log(app_window, "🔄 正在刷新UI界面...");
-                // 在新的作用域中进行不可变借用
-                let (tree_data, updated_preview) = {
-                    let state = app_state.borrow();
-                    let tree_data: Vec<TreeNodeData> = state.tree_flat
-                        .iter()
-                        .filter(|node| node.visible)
-                        .map(TreeNodeData::from)
-                        .collect();
-
-                    let updated_preview = state.extract_subtree_pretty(&selected_path).ok();
-                    (tree_data, updated_preview)
-                };
-
-                let model = ModelRc::new(VecModel::from(tree_data));
-                app_window.set_tree_model(model);
-                Self::append_writeback_log(app_window, "✅ 树视图已更新");
-
-                // 刷新预览区域
-                if let Some(preview) = updated_preview {
-                    app_window.set_preview_text(preview.into());
-                    Self::append_writeback_log(app_window, "✅ 预览区域已更新");
-                } else {
-                    Self::append_writeback_log(app_window, "⚠️ 预览区域更新失败");
-                }
-
-                // 更新性能信息
-                let current_perf = app_window.get_performance_info().to_string();
-                let update_info = format!("回写: {:.1}ms", update_duration.as_millis());
-                let new_perf = if current_perf.contains("回写:") {
-                    // 替换现有的回写信息
-                    current_perf.split(" | ").filter(|s| !s.starts_with("回写:"))
-                        .chain(std::iter::once(update_info.as_str()))
-                        .collect::<Vec<_>>().join(" | ")
-                } else {
-                    format!("{} | {}", current_perf, update_info)
-                };
-                app_window.set_performance_info(new_perf.into());
-
-                app_window.set_status_message(STATUS_WRITE_BACK_SUCCESS.into());
-                Self::append_writeback_log(app_window, "🎉 回写操作完成！");
-                tracing::info!("回写成功: {}，耗时: {:.1}ms", selected_path, update_duration.as_millis());
-            }
-            Err(e) => {
-                Self::append_writeback_log(app_window, &format!("❌ 回写失败: {}", e));
-                let error_msg = format!("{}{}", STATUS_ERROR_PREFIX, e);
-                app_window.set_status_message(error_msg.into());
-                tracing::error!("回写失败: {}", e);
-            }
-        }
-    }
 
     /// 一键获得最终产物：自动执行生成中间产物2 + 转换为最终产物
     fn handle_one_click_final_product(
@@ -1054,7 +985,7 @@ impl ViewModelBridge {
     }
 
     /// 处理上传回写文件（真正的非阻塞版本）
-    fn handle_upload_writeback_file(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, preview_full_text: &Rc<RefCell<String>>) {
+    fn handle_upload_writeback_file(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>, preview_full_text: &Rc<RefCell<String>>, final_full_text: &Rc<RefCell<String>>) {
         Self::append_writeback_log(app_window, "📂 开始选择回写文件...");
 
         // 打开文件选择对话框
@@ -1069,6 +1000,24 @@ impl ViewModelBridge {
                 Ok(content) => {
                     Self::append_writeback_log(app_window, &format!("📖 文件读取成功，大小: {} 字节", content.len()));
 
+                    // 格式验证：比较上传文件与最终产物的格式
+                    let final_product_text = final_full_text.borrow().clone();
+                    Self::append_writeback_log(app_window, &format!("🔍 最终产物文本长度: {} 字符", final_product_text.len()));
+
+                    if final_product_text.trim().is_empty() {
+                        Self::append_writeback_log(app_window, "⚠️ 最终产物为空，跳过格式验证");
+                    } else if let Err(validation_error) = Self::validate_json_format(&content, &final_product_text) {
+                        Self::append_writeback_log(app_window, &format!("⚠️ 格式验证失败: {}", validation_error));
+                        app_window.invoke_show_message_dialog(
+                            "格式不一致警告".into(),
+                            format!("请上传与最终产物格式一致的JSON文件\n\n错误详情: {}", validation_error).into()
+                        );
+                        return;
+                    } else {
+                        Self::append_writeback_log(app_window, "✅ 格式验证通过");
+                    }
+                    Self::append_writeback_log(app_window, "✅ 格式验证通过");
+
                     // 使用真正的后台线程处理，避免阻塞UI
                     let app_window_weak = app_window.as_weak();
 
@@ -1082,12 +1031,19 @@ impl ViewModelBridge {
                     std::thread::spawn(move || {
                         // 在后台线程中处理回写
                         match Self::process_writeback_in_background(&content, &intermediate_stage2, original_json, original_file_path, &app_window_weak) {
-                            Ok(modified_count) => {
+                            Ok((modified_count, updated_json)) => {
                                 // 使用invoke_from_event_loop安全地更新UI
                                 let _ = slint::invoke_from_event_loop(move || {
                                     if let Some(app_window) = app_window_weak.upgrade() {
                                         Self::append_writeback_log(&app_window, &format!("🎉 回写完成！共修改了 {} 个字段", modified_count));
                                         app_window.set_status_message(format!("回写成功，修改了 {} 个字段", modified_count).into());
+
+                                        // 触发JSON结构树更新的信号
+                                        if updated_json.is_some() {
+                                            Self::append_writeback_log(&app_window, "🔄 正在更新JSON结构树...");
+                                            // 通过设置一个特殊的状态来触发重新加载
+                                            app_window.set_status_message("JSON结构树更新完成".into());
+                                        }
                                     }
                                 });
                             }
@@ -1114,26 +1070,7 @@ impl ViewModelBridge {
         }
     }
 
-    /// 处理保存修改后的JSON
-    fn handle_save_modified_json(app_window: &AppWindow, app_state: &Rc<RefCell<AppState>>) {
-        let file_dialog = rfd::FileDialog::new()
-            .add_filter("JSON文件", &["json"])
-            .set_title("保存修改后的JSON文件")
-            .set_file_name("modified.json");
 
-        if let Some(path) = file_dialog.save_file() {
-            match app_state.borrow().save_modified_json(&path) {
-                Ok(_) => {
-                    app_window.set_status_message(format!("文件已保存到: {}", path.display()).into());
-                }
-                Err(e) => {
-                    app_window.set_status_message(format!("保存失败: {}", e).into());
-                }
-            }
-        } else {
-            app_window.set_status_message("用户取消了保存".into());
-        }
-    }
 
     /// 在后台线程中处理回写（真正的非阻塞版本）
     fn process_writeback_in_background(
@@ -1142,7 +1079,7 @@ impl ViewModelBridge {
         mut original_json: Option<serde_json::Value>,
         original_file_path: Option<PathBuf>,
         app_window_weak: &slint::Weak<AppWindow>
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(usize, Option<serde_json::Value>), Box<dyn std::error::Error + Send + Sync>> {
         // 更新日志的闭包（使用invoke_from_event_loop）
         let update_log = |app_window_weak: &slint::Weak<AppWindow>, message: String| {
             let app_window_weak_clone = app_window_weak.clone();
@@ -1250,9 +1187,89 @@ impl ViewModelBridge {
             let json_string = serde_json::to_string_pretty(json_data)?;
             std::fs::write(&original_path, json_string)?;
             update_log(app_window_weak, format!("✅ 已保存到: {}", original_path.display()));
+
+            // 触发重新加载文件以更新JSON结构树
+            let path_for_reload = original_path.clone();
+            let _ = slint::invoke_from_event_loop({
+                let app_window_weak = app_window_weak.clone();
+                move || {
+                    if let Some(app_window) = app_window_weak.upgrade() {
+                        Self::append_writeback_log(&app_window, "🔄 触发JSON结构树重新加载...");
+                        // 调用重新加载回调
+                        app_window.invoke_reload_file_after_writeback(path_for_reload.to_string_lossy().to_string().into());
+                    }
+                }
+            });
         }
 
-        Ok(modified_count)
+        Ok((modified_count, original_json))
+    }
+
+    /// 验证JSON格式是否一致
+    fn validate_json_format(upload_content: &str, final_product: &str) -> Result<(), String> {
+        // 如果最终产物为空，跳过验证
+        if final_product.trim().is_empty() {
+            return Ok(());
+        }
+
+        // 解析上传的JSON
+        let upload_json: serde_json::Value = serde_json::from_str(upload_content)
+            .map_err(|e| format!("上传文件不是有效的JSON: {}", e))?;
+
+        // 解析最终产物JSON
+        let final_json: serde_json::Value = serde_json::from_str(final_product)
+            .map_err(|e| format!("最终产物不是有效的JSON: {}", e))?;
+
+        // 比较JSON结构
+        if !Self::compare_json_structure(&upload_json, &final_json) {
+            return Err("JSON结构不匹配，字段数量或类型不一致".to_string());
+        }
+
+        Ok(())
+    }
+
+    /// 比较两个JSON的结构是否一致
+    fn compare_json_structure(json1: &serde_json::Value, json2: &serde_json::Value) -> bool {
+        use serde_json::Value;
+
+        match (json1, json2) {
+            (Value::Object(obj1), Value::Object(obj2)) => {
+                // 比较对象的键数量
+                if obj1.len() != obj2.len() {
+                    return false;
+                }
+                // 递归比较每个键的结构
+                for (key, value1) in obj1 {
+                    if let Some(value2) = obj2.get(key) {
+                        if !Self::compare_json_structure(value1, value2) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+            (Value::Array(arr1), Value::Array(arr2)) => {
+                // 比较数组长度
+                if arr1.len() != arr2.len() {
+                    return false;
+                }
+                // 递归比较数组元素结构
+                for (item1, item2) in arr1.iter().zip(arr2.iter()) {
+                    if !Self::compare_json_structure(item1, item2) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // 对于基本类型，只比较类型是否相同
+            (Value::String(_), Value::String(_)) => true,
+            (Value::Number(_), Value::Number(_)) => true,
+            (Value::Bool(_), Value::Bool(_)) => true,
+            (Value::Null, Value::Null) => true,
+            _ => false, // 类型不匹配
+        }
     }
 
     /// 使用JSONPath更新JSON值（独立函数，不依赖AppState）
@@ -1280,6 +1297,123 @@ impl ViewModelBridge {
         }
 
         Ok(())
+    }
+
+    /// 回写完成后更新JSON结构树
+    fn update_json_tree_after_writeback(
+        app_window: &AppWindow,
+        app_state: &Rc<RefCell<AppState>>,
+        updated_json: serde_json::Value
+    ) {
+        // 更新AppState中的DOM数据
+        {
+            let mut state = app_state.borrow_mut();
+            state.dom = Some(updated_json);
+            // 重新构建影子树
+            if let Some(ref dom) = state.dom {
+                state.tree_flat = crate::model::shadow_tree::build_shadow_tree(dom);
+                // 更新可见性
+                state.update_visibility_by_expansion();
+            }
+        }
+
+        // 更新UI中的树模型
+        let tree_data: Vec<TreeNodeData> = {
+            let state = app_state.borrow();
+            state.tree_flat
+                .iter()
+                .filter(|node| node.visible)
+                .map(TreeNodeData::from)
+                .collect()
+        };
+
+        let model = ModelRc::new(VecModel::from(tree_data));
+        app_window.set_tree_model(model);
+    }
+
+    /// 线程安全的JSON结构树更新（在后台线程中调用）
+    fn update_json_tree_after_writeback_sync(
+        app_state: &Rc<RefCell<AppState>>,
+        updated_json: serde_json::Value,
+        app_window_weak: &slint::Weak<AppWindow>
+    ) {
+        // 更新AppState中的DOM数据
+        {
+            let mut state = app_state.borrow_mut();
+            state.dom = Some(updated_json);
+            // 重新构建影子树
+            if let Some(ref dom) = state.dom {
+                state.tree_flat = crate::model::shadow_tree::build_shadow_tree(dom);
+                // 更新可见性
+                state.update_visibility_by_expansion();
+            }
+        }
+
+        // 准备UI更新数据
+        let tree_data: Vec<TreeNodeData> = {
+            let state = app_state.borrow();
+            state.tree_flat
+                .iter()
+                .filter(|node| node.visible)
+                .map(TreeNodeData::from)
+                .collect()
+        };
+
+        // 在主线程中更新UI
+        let _ = slint::invoke_from_event_loop({
+            let app_window_weak = app_window_weak.clone();
+            move || {
+                if let Some(app_window) = app_window_weak.upgrade() {
+                    let model = ModelRc::new(VecModel::from(tree_data));
+                    app_window.set_tree_model(model);
+                    Self::append_writeback_log(&app_window, "✅ JSON结构树已更新");
+                }
+            }
+        });
+    }
+
+    /// 处理回写后重新加载文件
+    fn handle_reload_file_after_writeback(
+        app_window: &AppWindow,
+        app_state: &Rc<RefCell<AppState>>,
+        file_path: &str
+    ) {
+        use std::path::Path;
+
+        let path = Path::new(file_path);
+        if !path.exists() {
+            Self::append_writeback_log(app_window, "❌ 文件不存在，无法重新加载");
+            return;
+        }
+
+        // 重新加载文件
+        match app_state.borrow_mut().load_file(path) {
+            Ok(()) => {
+                Self::append_writeback_log(app_window, "✅ 文件重新加载成功");
+            }
+            Err(e) => {
+                Self::append_writeback_log(app_window, &format!("❌ 文件重新加载失败: {}", e));
+                app_window.set_status_message(format!("重新加载失败: {}", e).into());
+                return;
+            }
+        }
+
+        // 在借用结束后，重新获取数据更新UI
+        let tree_data: Vec<TreeNodeData> = {
+            let state = app_state.borrow();
+            state.tree_flat
+                .iter()
+                .filter(|node| node.visible)
+                .map(TreeNodeData::from)
+                .collect()
+        };
+
+        let model = ModelRc::new(VecModel::from(tree_data));
+        app_window.set_tree_model(model);
+        app_window.set_current_path(file_path.into());
+
+        Self::append_writeback_log(app_window, "✅ JSON结构树已更新");
+        app_window.set_status_message("JSON结构树更新完成".into());
     }
 }
 

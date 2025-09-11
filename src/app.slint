@@ -1,7 +1,7 @@
 // JSON翻译工具主窗口：三分栏布局（树视图、预览区、粘贴区）
 // 遵循xqwn需求：支持大文件JSON树导航、节点提取、精确回写
 
-import { Button, ScrollView, ListView, TextEdit, ProgressIndicator } from "std-widgets.slint";
+import { Button, ScrollView, ListView, TextEdit, ProgressIndicator, StandardButton } from "std-widgets.slint";
 
 // 树节点数据结构（与Rust shadow_tree::JsonTreeNode对应）
 struct TreeNodeData {
@@ -60,7 +60,7 @@ export component AppWindow inherits Window {
     in property<string> current_path: "";                    // 当前打开的文件路径
     in property<[TreeNodeData]> tree_model: [];              // 树视图数据模型
     in property<string> preview_text: "";                    // 预览区文本（中间产物 第二阶段）
-    in-out property<string> paste_text: "";                  // 粘贴区文本
+
     in property<string> selected_json_path: "";              // 当前选中节点的JSONPath/阶段提示
     in property<string> status_message: "就绪";              // 状态栏消息
     in property<string> performance_info: "";               // 性能信息
@@ -81,11 +81,16 @@ export component AppWindow inherits Window {
     // === 回写日志属性 ===
     in-out property<string> writeback_log: "";              // 回写过程日志
 
+    // === 消息对话框属性 ===
+    in-out property<bool> message_dialog_visible: false;     // 消息对话框是否可见
+    in-out property<string> message_dialog_title: "";        // 消息对话框标题
+    in-out property<string> message_dialog_text: "";         // 消息对话框内容
+
     // === 回调函数 ===
     callback load_file();                                    // 加载文件
     callback node_selected(string);                         // 节点被选中
     callback copy_pressed();                                 // 复制按钮
-    callback write_back_pressed();                           // 回写按钮
+
     callback search_changed(string);                        // 搜索过滤改变
     callback toggle_node_expanded(string);                  // 切换节点展开状态
     callback one_click_final_product();                      // 一键获得最终产物按钮
@@ -96,8 +101,11 @@ export component AppWindow inherits Window {
     callback preview_page_changed(int);                      // 中间产物分页改变
     callback final_page_changed(int);                        // 最终产物分页改变
     callback upload_writeback_file();                        // 上传回写文件
-    callback save_modified_json();                           // 保存修改后的JSON
+
     callback clear_writeback_log();                          // 清空回写日志
+    callback show_message_dialog(string, string);            // 显示消息对话框(标题, 内容)
+    callback close_message_dialog();                         // 关闭消息对话框
+    callback reload_file_after_writeback(string);            // 回写后重新加载文件
 
     // === 进度条控制函数 ===
     public function show_progress(text: string) {
@@ -590,18 +598,7 @@ export component AppWindow inherits Window {
                                 height: button_height;
                                 clicked => { upload_writeback_file(); }
                             }
-                            TerminalButton {
-                                text: "保存修改";
-                                height: button_height;
-                                enabled: paste_text != "";
-                                clicked => { save_modified_json(); }
-                            }
-                            TerminalButton {
-                                text: "回写";
-                                height: button_height;
-                                enabled: paste_text != "" && selected_json_path != "";
-                                clicked => { write_back_pressed(); }
-                            }
+
                         }
                     }
 
@@ -627,14 +624,6 @@ export component AppWindow inherits Window {
 
                             HorizontalLayout {
                                 spacing: 4px;
-
-                                TerminalButton {
-                                    text: "测试日志";
-                                    height: 24px;
-                                    clicked => {
-                                        writeback_log = "[测试] 这是一条测试日志\n" + writeback_log;
-                                    }
-                                }
 
                                 TerminalButton {
                                     text: "清空日志";
@@ -740,6 +729,69 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                     horizontal-alignment: right;
+                }
+            }
+        }
+
+
+    }
+
+    // === 消息对话框覆盖层 ===
+    if message_dialog_visible: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.5);
+        z: 1000; // 确保在最顶层
+
+        TouchArea {
+            clicked => { close_message_dialog(); }
+        }
+
+        Rectangle {
+            width: 400px;
+            height: 200px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: background_primary;
+            border-width: 2px;
+            border-color: accent_color;
+            border-radius: 8px;
+            drop-shadow-blur: 10px;
+            drop-shadow-color: rgba(0, 0, 0, 0.3);
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 16px;
+
+                // 标题
+                Text {
+                    text: message_dialog_title;
+                    font-size: 16px;
+                    font-family: terminal_font;
+                    font-weight: 600;
+                    color: accent_color;
+                    horizontal-alignment: center;
+                }
+
+                // 内容
+                Text {
+                    text: message_dialog_text;
+                    font-size: 14px;
+                    font-family: terminal_font;
+                    color: text_primary;
+                    wrap: TextWrap.word-wrap;
+                    horizontal-alignment: center;
+                    vertical-stretch: 1;
+                }
+
+                // 按钮
+                HorizontalLayout {
+                    alignment: center;
+
+                    TerminalButton {
+                        text: "确定";
+                        clicked => { close_message_dialog(); }
+                    }
                 }
             }
         }
