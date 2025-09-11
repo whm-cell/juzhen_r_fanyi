@@ -219,100 +219,10 @@ jobs:
         )
         EOF
 
-    # Create README for each platform
-    - name: Create platform README
-      shell: bash
-      run: |
-        cat > release/README-${{ matrix.name }}.md << 'EOF'
-        # JSON翻译工具 - ${{ matrix.name }} 版本
 
-        > 基于Rust+Slint的高性能JSON翻译工具，支持大文件处理、影子树索引、JSONPath精确回写
 
-        ## 🚀 快速开始
 
-        ### 方式1：使用启动脚本（推荐）
-        ```bash
-        # Unix系统
-        ./start-${{ matrix.name }}.sh
 
-        # Windows系统
-        start-${{ matrix.name }}.bat
-        ```
-
-        ### 方式2：直接运行
-        ```bash
-        # GPU加速模式（推荐）
-        ./juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}
-
-        # 软件渲染模式（无GPU环境）
-        SLINT_BACKEND=winit-skia-software ./juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}
-
-        # 极简模式（功能受限）
-        SLINT_BACKEND=winit-software ./juzhen_r_fanyi-${{ matrix.name }}${{ matrix.extension }}
-        ```
-
-        ## 💻 系统要求
-
-        - **操作系统**: ${{ matrix.name }}
-        - **内存**: 建议2GB以上
-        - **存储**: 50MB可用空间
-        - **显示**: 支持1024x768以上分辨率
-        - **GPU**: 可选（有GPU时性能更佳）
-
-        ## ✨ 功能特性
-
-        - 🚀 **高性能处理**: 支持大型JSON文件（16K+节点）
-        - 🌳 **智能树视图**: 扁平化显示、字符过滤、空值过滤
-        - 🔍 **强大搜索**: 实时搜索和高级过滤功能
-        - 📝 **精确回写**: JSONPath精确定位和数据回写
-        - 🎨 **现代界面**: 基于Slint UI的现代化界面
-        - 🔧 **多渲染器**: 智能选择最适合的渲染模式
-        - 🌍 **中文支持**: 完整的中文字符显示和处理
-
-        ## 🛠️ 故障排除
-
-        ### 程序无法启动
-        1. 使用启动脚本自动选择合适的渲染器
-        2. 检查系统图形驱动是否正常
-        3. 在终端中运行查看详细错误信息
-
-        ### 性能问题
-        - 优先使用GPU加速模式
-        - 大文件处理时关闭不必要的过滤器
-        - 确保有足够的系统内存
-
-        ### 显示问题
-        - 中文字符不显示：使用Skia渲染器模式
-        - 界面卡顿：尝试软件渲染模式
-        - 阴影效果异常：检查GPU驱动支持
-
-        ## 📚 更多信息
-
-        - 项目主页: https://github.com/your-repo/juzhen_r_fanyi
-        - 技术文档: 查看项目中的 `study.md`
-        - 开发总结: 查看项目中的 `项目完成总结.md`
-
-        ---
-        *构建时间: ${{ github.run_id }} | 版本: ${{ github.sha }}*
-        EOF
-
-    # Copy project documentation
-    - name: Copy project documentation
-      shell: bash
-      run: |
-        # 复制项目文档到发布目录
-        if [ -f "项目完成总结.md" ]; then
-          cp "项目完成总结.md" release/
-        fi
-        if [ -f "study.md" ]; then
-          cp "study.md" release/
-        fi
-        if [ -f "README.md" ]; then
-          cp "README.md" release/
-        fi
-        if [ -f "Cargo.toml" ]; then
-          cp "Cargo.toml" release/
-        fi
 
     # Upload artifacts
     - name: Upload build artifacts
@@ -406,12 +316,10 @@ jobs:
         - **线程安全设计**: 使用Rc<RefCell<T>>确保UI线程安全
         - **内存优化**: 高度优化的内存使用和性能
 
-        ### 📚 文档说明
+        ### � 包内容
         每个平台包都包含：
-        - **README-{platform}.md**: 平台特定的使用说明
+        - **juzhen_r_fanyi**: 主程序二进制文件
         - **start-{platform}**: 智能启动脚本
-        - **项目完成总结.md**: 完整的开发总结
-        - **study.md**: 详细的技术教程和AI阅读指南
 
         ### 🔧 故障排除
         如果遇到问题，请：
